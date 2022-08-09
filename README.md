@@ -3,7 +3,7 @@
 
 Sigga is a minimal Ghidra plugin/extension to create and find function signatures. It is well documented and easily maintainable.
 
-It contains the core functionality of [the IDA Pro plugin equivalent](https://github.com/ajkhoury/SigMaker-x64) (creating & finding signatures).
+It contains the core functionality of [the IDA Pro plugin equivalent](https://github.com/ajkhoury/SigMaker-x64).
 
 ## Installation
 To install Sigga, simply [download the latest release](https://github.com/lexika979/Sigga/releases) and put *Sigga.java* inside C:/Users/(your username)/ghidra_scripts. If the folder does not exist yet, create it first. - That's it!
