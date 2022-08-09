@@ -160,7 +160,7 @@ public class Sigga extends GhidraScript {
 
         // If we have no function selected, fail
         if (functionBody == null) {
-            printerr("Failed to create signature: No function selected\n");
+            printerr("Failed to create signature: No function selected");
             return;
         }
 
@@ -174,7 +174,7 @@ public class Sigga extends GhidraScript {
         // We know the signature is valid at this point, so no need to catch the InvalidParameterException
         if (!findAddressForSignature(signature).equals(functionBody.getMinAddress())) {
             // I don't see what other problem could cause this
-            printerr("Failed to create signature: Function is (most likely) not big enough to create a unique signature\n");
+            printerr("Failed to create signature: Function is (most likely) not big enough to create a unique signature");
             return;
         }
 
@@ -200,7 +200,7 @@ public class Sigga extends GhidraScript {
         try {
             address = findAddressForSignature(signature);
         } catch (InvalidParameterException exception) {
-            printerr("Failed to find signature: " + exception.getMessage() + "\n");
+            printerr("Failed to find signature: " + exception.getMessage());
         }
 
         if (address == null) {
