@@ -1,4 +1,4 @@
-//Budget sigmaker for Ghidra
+//Budget sigmaker for Ghidra (Version 1.0)
 //@author lexika
 //@category Functions
 //@keybinding
