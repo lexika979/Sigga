@@ -13,6 +13,7 @@ I highly recommend binding Sigga to a shortcut to save yourself a lot of clicks.
 1) Open Ghidra and the Script manager:
 
 ![](https://i.imgur.com/usOQWPh.png)
+
 2) Open the "Functions" folder:
 
 ![](https://i.imgur.com/sIxclgU.png)
