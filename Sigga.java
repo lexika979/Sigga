@@ -141,7 +141,7 @@ public class Sigga extends GhidraScript {
      * Given an iterator of instructions, build a string-signature by converting the bytes into a hex format
      *
      * @param instructions The instructions to create a signature from
-     * @param maxLength The maximum length, in bytes
+     * @param maxLength    The maximum length, in bytes
      * @return The built signature
      * @throws MemoryAccessException If the instructions are in non-accessible memory
      */
@@ -206,6 +206,7 @@ public class Sigga extends GhidraScript {
      * Create a relative signature for the function passed, null if none can be found
      * To achieve this, we iterate over all functions that call the function we are trying to make a signature for
      * Then we decompile them, find the call, try to sig the call itself
+     *
      * @param function     The function to create a signature for
      * @param functionBody The function's body
      * @param instructions The function's instructions
@@ -221,29 +222,26 @@ public class Sigga extends GhidraScript {
             // Decompile it
             DecompileResults decompileResults = decompInterface.decompileFunction(callingFunction, 1, monitor);
 
-            // Iterate all PcodeOps (Instructions) in the function
+            // Iterate all Instructions in the function
             for (Iterator<PcodeOpAST> it = decompileResults.getHighFunction().getPcodeOps(); it.hasNext(); ) {
-                PcodeOpAST pcodeOpAST = it.next();
+                PcodeOpAST instruction = it.next();
 
-                // Is it a call?
-                if (pcodeOpAST.getMnemonic().equals("CALL")) {
-                    // Not sure if this is needed/possible, but I don't want to take any chances
-                    if (pcodeOpAST.getNumInputs() >= 1) {
-                        // The address of the call instruction
-                        Address source = pcodeOpAST.getSeqnum().getTarget();
-                        // The address of the function the instruction is calling
-                        Address target = pcodeOpAST.getInput(0).getAddress();
+                // Is the current instruction a call?
+                if (instruction.getMnemonic().equals("CALL")) {
+                    // The address of the call instruction
+                    Address source = instruction.getSeqnum().getTarget();
+                    // The address of the function it's calling
+                    Address target = instruction.getInput(0).getAddress();
 
-                        // Is this calling the function we are trying to create a signature for?
-                        if (target.equals(functionBody.getMinAddress())) {
-                            AddressSetView callingFunctionBody = callingFunction.getBody();
+                    // Is this calling the function we are trying to create a signature for?
+                    if (target.equals(functionBody.getMinAddress())) {
+                        AddressSetView callingFunctionBody = callingFunction.getBody();
 
-                            // To make sure we only build a signature from the call address util function end, we need the size
-                            int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(callingFunctionBody.getMinAddress());
+                        // To make sure we only build a signature from the call address util function end, we need the size
+                        int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(source);
 
-                            // Done!
-                            return buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
-                        }
+                        // Done!
+                        return buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
                     }
                 }
             }
