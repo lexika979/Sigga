@@ -240,7 +240,7 @@ public class Sigga extends GhidraScript {
                         // To make sure we only build a signature from the call address util function end, we need the size
                         int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(source);
 
-                        // Done!
+                        // Refinement will happen inside createSignature(), no need to modify the signature further here
                         return buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
                     }
                 }
