@@ -100,6 +100,10 @@ public class Sigga extends GhidraScript {
         private byte[] mask;
     }
 
+    private void logVerbose(String toLog) {
+        println("Verbose> " + toLog);
+    }
+
     /**
      * Get the function of the currently selected address in the GUI
      *
@@ -202,6 +206,42 @@ public class Sigga extends GhidraScript {
         return signature;
     }
 
+    private String createRelativeSignatureFromInstructions(Function callingFunction, Iterator<PcodeOpAST> instructions,
+                                                           AddressSetView functionBody) throws MemoryAccessException {
+        // Iterate all Instructions in the function
+        while (instructions.hasNext()) {
+            PcodeOpAST instruction = instructions.next();
+
+            // Is the current instruction a call?
+            if (instruction.getMnemonic().equals("CALL")) {
+                // The address of the call instruction
+                Address source = instruction.getSeqnum().getTarget();
+                // The address of the function it's calling
+                Address target = instruction.getInput(0).getAddress();
+
+                // Is this calling the function we are trying to create a signature for?
+                if (target.equals(functionBody.getMinAddress())) {
+                    AddressSetView callingFunctionBody = callingFunction.getBody();
+
+                    // To make sure we only build a signature from the call address util function end, we need the size
+                    int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(source);
+
+                    String signature = buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
+                    // Is the signature unique?
+                    if (!findAddressForSignature(signature).equals(functionBody.getMinAddress())) {
+                        // Nope, try to create a signature on the next call if present
+                        continue;
+                    }
+
+                    // We found a unique signature, further refinement will happen inside createSignature() later, so just return it
+                    return signature;
+                }
+            }
+        }
+
+        return null;
+    }
+
     /**
      * Create a relative signature for the function passed, null if none can be found
      * To achieve this, we iterate over all functions that call the function we are trying to make a signature for
@@ -221,29 +261,13 @@ public class Sigga extends GhidraScript {
             // Decompile it
             DecompileResults decompileResults = decompInterface.decompileFunction(callingFunction, 1, monitor);
 
-            // Iterate all Instructions in the function
-            for (Iterator<PcodeOpAST> it = decompileResults.getHighFunction().getPcodeOps(); it.hasNext(); ) {
-                PcodeOpAST instruction = it.next();
-
-                // Is the current instruction a call?
-                if (instruction.getMnemonic().equals("CALL")) {
-                    // The address of the call instruction
-                    Address source = instruction.getSeqnum().getTarget();
-                    // The address of the function it's calling
-                    Address target = instruction.getInput(0).getAddress();
-
-                    // Is this calling the function we are trying to create a signature for?
-                    if (target.equals(functionBody.getMinAddress())) {
-                        AddressSetView callingFunctionBody = callingFunction.getBody();
-
-                        // To make sure we only build a signature from the call address util function end, we need the size
-                        int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(source);
-
-                        // Refinement will happen inside createSignature(), no need to modify the signature further here
-                        return buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
-                    }
-                }
+            // Find the call to the target function, and try to create a signature
+            String signature = createRelativeSignatureFromInstructions(callingFunction, decompileResults.getHighFunction().getPcodeOps(), functionBody);
+            if (signature != null) {
+                return signature;
             }
+
+            // Cannot create a unique signature from the function's call, try another function if present
         }
 
         // We could not find a function containing a siggable call to our target function
