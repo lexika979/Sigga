@@ -209,10 +209,9 @@ public class Sigga extends GhidraScript {
      *
      * @param function     The function to create a signature for
      * @param functionBody The function's body
-     * @param instructions The function's instructions
      * @return The first unique relative signature found
      */
-    private String createRelativeSignature(Function function, AddressSetView functionBody, InstructionIterator instructions) throws MemoryAccessException {
+    private String createRelativeSignature(Function function, AddressSetView functionBody) throws MemoryAccessException {
         // Prepare the decompiler
         DecompInterface decompInterface = new DecompInterface();
         decompInterface.openProgram(currentProgram);
@@ -279,7 +278,7 @@ public class Sigga extends GhidraScript {
             // Function signature is not unique, make a relative signature instead
             println("Warning: Function is not big enough to create a unique signature. Generating relative signature instead...");
 
-            signature = createRelativeSignature(function, functionBody, instructions);
+            signature = createRelativeSignature(function, functionBody);
             if (signature == null) {
                 printerr("Failed to create signature: Cannot find unique function or relative signature");
                 return;
