@@ -192,7 +192,7 @@ public class Sigga extends GhidraScript {
 
         // Try to find the signature
         return currentProgram.getMemory().findBytes(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
-                byteSignature.getBytes(), byteSignature.getMask(), true, null);
+                byteSignature.getBytes(), byteSignature.getMask(), true, monitor);
     }
 
     private void findSignature(String signature) {
