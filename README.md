@@ -1,7 +1,7 @@
 # Sigga - sigmaker for Ghidra
 *The name "Sigga" is a mix of the german word "Digga" (roughly translates to "brother"), and "Signature"*
 
-Sigga is a minimal Ghidra plugin/extension to create and find function signatures. It is well documented and easily maintainable.
+Sigga is a minimal Ghidra script to create and find function signatures. It is well documented and easily maintainable.
 
 ## Features
 It contains the core functionality of [the IDA Pro plugin equivalent](https://github.com/ajkhoury/SigMaker-x64) and some extras for the user's convenience.
