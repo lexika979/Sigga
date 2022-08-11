@@ -32,7 +32,7 @@ public class Sigga extends GhidraScript {
         }
 
         /**
-         * Parse a string signature (like "56 8B ? ? 06 FF 8B") two arrays representing the actual signature and a mask
+         * Parse a string signature (like "56 8B ? ? 06 FF 8B") to arrays representing the actual signature and a mask
          * This is done, so that we can pass these two arrays directly into currentProgram.getMemory().findBytes()
          *
          * @param signature The string-format signature to parse/convert
