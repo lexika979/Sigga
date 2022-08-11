@@ -14,6 +14,9 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.mem.MemoryAccessException;
 
+import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.StringSelection;
 import java.security.InvalidParameterException;
 import java.util.Arrays;
 import java.util.LinkedList;
@@ -163,7 +166,8 @@ public class Sigga extends GhidraScript {
     /**
      * Recursively refine the signature/make it smaller by removing the last byte and trying to find it util it is not unique anymore
      * With any valid signature as an input, it will return the smallest possible signature that is still guaranteed to be unique
-     * @param signature The signature to refine
+     *
+     * @param signature       The signature to refine
      * @param functionAddress The function address the signature points to
      * @return The refined signature
      */
@@ -190,6 +194,7 @@ public class Sigga extends GhidraScript {
 
     /**
      * Create a signature for the function currently selected in the editor and output it
+     *
      * @throws MemoryAccessException If the selected function is inside not-accessible memory
      */
     private void createSignature() throws MemoryAccessException {
@@ -221,11 +226,30 @@ public class Sigga extends GhidraScript {
         // TODO: Make this faster - Depending on the program's size and the size of the signature (function body) this could take quite some time
         signature = refineSignature(signature, functionBody.getMinAddress());
 
-        println(signature);
+        // Selecting and copying the signature manually is a chore :)
+        copySignatureToClipboard(signature);
+
+        println(signature + " (Copied to clipboard)");
+    }
+
+    /**
+     * Copy the generated signature to the clipboard for ease of use
+     * @param signature The signature to copy to the clipboard
+     */
+    private void copySignatureToClipboard(String signature) {
+        StringSelection selection = new StringSelection(signature);
+
+        try {
+            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+            clipboard.setContents(selection, selection);
+        } catch (AWTError | IllegalStateException exception) {
+            println("Warning: Failed to copy signature to clipboard: " + exception.getMessage());
+        }
     }
 
     /**
      * Try to find the signature
+     *
      * @param signature The signature to find
      * @return The first address the signature matches on
      * @throws InvalidParameterException If the signature has a invalid format
@@ -241,6 +265,7 @@ public class Sigga extends GhidraScript {
 
     /**
      * Finds and outputs the signature
+     *
      * @param signature The signature to find and output
      */
     private void findSignature(String signature) {
@@ -265,6 +290,7 @@ public class Sigga extends GhidraScript {
 
     /**
      * The script entry point - This gets called when it's executed
+     *
      * @throws Exception If anything in the script went seriously wrong
      */
     public void run() throws Exception {
@@ -273,8 +299,12 @@ public class Sigga extends GhidraScript {
                         "Create signature",
                         "Find signature"
                 ), "Create signature")) {
-            case "Create signature": createSignature(); break;
-            case "Find signature": findSignature(askString("Sigga", "Enter signature to find:", "")); break;
+            case "Create signature":
+                createSignature();
+                break;
+            case "Find signature":
+                findSignature(askString("Sigga", "Enter signature to find:", ""));
+                break;
         }
     }
 }
