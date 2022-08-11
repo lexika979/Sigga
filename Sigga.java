@@ -5,20 +5,28 @@
 //@menupath
 //@toolbar
 
+import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.decompiler.DecompiledFunction;
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSetView;
+import ghidra.program.model.address.AddressSetViewAdapter;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.pcode.HighSymbol;
+import ghidra.program.model.pcode.PcodeOpAST;
+import ghidra.program.model.pcode.Varnode;
 
 import java.awt.*;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.security.InvalidParameterException;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 
@@ -93,12 +101,12 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Get the function body of the currently selected function in the GUI
+     * Get the function of the currently selected address in the GUI
      *
-     * @return The body of the selected function, otherwise null
+     * @return The selected function, otherwise null
      */
-    private AddressSetView getCurrentFunctionBody() {
-        FunctionManager functionManager = currentProgram.getFunctionManager();
+    private Function getCurrentFunction() {
+        // Not sure if this can happen
         if (currentLocation == null) {
             return null;
         }
@@ -108,12 +116,7 @@ public class Sigga extends GhidraScript {
             return null;
         }
 
-        Function function = functionManager.getFunctionContaining(address);
-        if (function == null) {
-            return null;
-        }
-
-        return function.getBody();
+        return currentProgram.getFunctionManager().getFunctionContaining(address);
     }
 
     /**
@@ -138,12 +141,14 @@ public class Sigga extends GhidraScript {
      * Given an iterator of instructions, build a string-signature by converting the bytes into a hex format
      *
      * @param instructions The instructions to create a signature from
+     * @param maxLength The maximum length, in bytes
      * @return The built signature
      * @throws MemoryAccessException If the instructions are in non-accessible memory
      */
-    private String buildSignatureFromInstructions(InstructionIterator instructions) throws MemoryAccessException {
+    private String buildSignatureFromInstructions(InstructionIterator instructions, int maxLength) throws MemoryAccessException {
         StringBuilder signature = new StringBuilder();
 
+        int bytes = 0;
         for (Instruction instruction : instructions) {
             // It seems that instructions that contain addresses which may change at runtime
             // are always something else then "fallthrough", so we just do this.
@@ -157,6 +162,11 @@ public class Sigga extends GhidraScript {
                 for (byte b : instruction.getBytes()) {
                     signature.append("? ");
                 }
+            }
+
+            bytes++;
+            if (bytes >= maxLength) {
+                return signature.toString();
             }
         }
 
@@ -193,47 +203,106 @@ public class Sigga extends GhidraScript {
     }
 
     /**
+     * Create a relative signature for the function passed, null if none can be found
+     * To achieve this, we iterate over all functions that call the function we are trying to make a signature for
+     * Then we decompile them, find the call, try to sig the call itself
+     * @param function     The function to create a signature for
+     * @param functionBody The function's body
+     * @param instructions The function's instructions
+     * @return The first unique relative signature found
+     */
+    private String createRelativeSignature(Function function, AddressSetView functionBody, InstructionIterator instructions) throws MemoryAccessException {
+        // Prepare the decompiler
+        DecompInterface decompInterface = new DecompInterface();
+        decompInterface.openProgram(currentProgram);
+
+        // Iterate all functions that call the function we are creating a signature for
+        for (Function callingFunction : function.getCallingFunctions(monitor)) {
+            // Decompile it
+            DecompileResults decompileResults = decompInterface.decompileFunction(callingFunction, 1, monitor);
+
+            // Iterate all PcodeOps (Instructions) in the function
+            for (Iterator<PcodeOpAST> it = decompileResults.getHighFunction().getPcodeOps(); it.hasNext(); ) {
+                PcodeOpAST pcodeOpAST = it.next();
+
+                // Is it a call?
+                if (pcodeOpAST.getMnemonic().equals("CALL")) {
+                    // Not sure if this is needed/possible, but I don't want to take any chances
+                    if (pcodeOpAST.getNumInputs() >= 1) {
+                        // The address of the call instruction
+                        Address source = pcodeOpAST.getSeqnum().getTarget();
+                        // The address of the function the instruction is calling
+                        Address target = pcodeOpAST.getInput(0).getAddress();
+
+                        // Is this calling the function we are trying to create a signature for?
+                        if (target.equals(functionBody.getMinAddress())) {
+                            AddressSetView callingFunctionBody = callingFunction.getBody();
+
+                            // To make sure we only build a signature from the call address util function end, we need the size
+                            int callingFunctionSize = (int) callingFunctionBody.getMaxAddress().subtract(callingFunctionBody.getMinAddress());
+
+                            // Done!
+                            return buildSignatureFromInstructions(currentProgram.getListing().getInstructions(source, true), callingFunctionSize);
+                        }
+                    }
+                }
+            }
+        }
+
+        // We could not find a function containing a siggable call to our target function
+        return null;
+    }
+
+    /**
      * Create a signature for the function currently selected in the editor and output it
      *
-     * @throws MemoryAccessException If the selected function is inside not-accessible memory
+     * @throws MemoryAccessException If the selected function is inside non-accessible memory
      */
     private void createSignature() throws MemoryAccessException {
-        // Get currently selected function's body
-        AddressSetView functionBody = getCurrentFunctionBody();
+        Function function = getCurrentFunction();
 
         // If we have no function selected, fail
-        if (functionBody == null) {
+        if (function == null) {
             printerr("Failed to create signature: No function selected");
             return;
         }
+
+        AddressSetView functionBody = function.getBody();
 
         // Get instructions for current function
         InstructionIterator instructions = currentProgram.getListing().getInstructions(functionBody, true);
 
         // Generate signature for whole function
-        String signature = buildSignatureFromInstructions(instructions);
+        String signature = buildSignatureFromInstructions(instructions, Integer.MAX_VALUE);
 
         // Try to find it once to make sure the first address found matches the one we generated it from
         // We know the signature is valid at this point, so no need to catch the InvalidParameterException
         if (!findAddressForSignature(signature).equals(functionBody.getMinAddress())) {
-            // I don't see what other problem could cause this
-            printerr("Failed to create signature: Function is (most likely) not big enough to create a unique signature");
-            return;
+            // Function signature is not unique, make a relative signature instead
+            println("Warning: Function is not big enough to create a unique signature. Generating relative signature instead...");
+
+            signature = createRelativeSignature(function, functionBody, instructions);
+            if (signature == null) {
+                printerr("Failed to create signature: Cannot find unique function or relative signature");
+                return;
+            }
         }
 
         // Try to make the signature as small as possible while still being the first one found
         // Also strip trailing whitespaces and wildcards
-        // TODO: Make this faster - Depending on the program's size and the size of the signature (function body) this could take quite some time
+        // TODO: Make this faster - Depending on the program's size and the size of the signature (function body), this could take quite some time
         signature = refineSignature(signature, functionBody.getMinAddress());
 
         // Selecting and copying the signature manually is a chore :)
         copySignatureToClipboard(signature);
 
+        //                    (    Hopefully :)   )
         println(signature + " (Copied to clipboard)");
     }
 
     /**
      * Copy the generated signature to the clipboard for ease of use
+     *
      * @param signature The signature to copy to the clipboard
      */
     private void copySignatureToClipboard(String signature) {
