@@ -20,12 +20,21 @@ import java.util.LinkedList;
 import java.util.List;
 
 public class Sigga extends GhidraScript {
-    // Helper class to convert a string signature to bytes + mask, also acts as a container for them
+    /**
+     * Helper class to convert a string signature to bytes + mask, also acts as a container for them
+     */
     private static class ByteSignature {
         public ByteSignature(String signature) throws InvalidParameterException {
             parseSignature(signature);
         }
 
+        /**
+         * Parse a string signature (like "56 8B F1 8B 06 FF") two arrays representing the actual signature and a mask
+         * This is done, so we can pass these two arrays directly into currentProgram.getMemory().findBytes()
+         *
+         * @param signature The string-format signature to parse/convert
+         * @throws InvalidParameterException If the signature has an invalid format
+         */
         private void parseSignature(String signature) throws InvalidParameterException {
             // Remove all whitespaces
             signature = signature.replaceAll(" ", "");
@@ -80,6 +89,11 @@ public class Sigga extends GhidraScript {
         private byte[] mask;
     }
 
+    /**
+     * Get the function body of the currently selected function in the GUI
+     *
+     * @return The body of the selected function, otherwise null
+     */
     private AddressSetView getCurrentFunctionBody() {
         FunctionManager functionManager = currentProgram.getFunctionManager();
         if (currentLocation == null) {
@@ -99,6 +113,12 @@ public class Sigga extends GhidraScript {
         return function.getBody();
     }
 
+    /**
+     * Remove useless whitespaces and trailing wildcards
+     *
+     * @param signature The signature to clean
+     * @return The cleaned signature
+     */
     private String cleanSignature(String signature) {
         // Remove trailing whitespace
         signature = signature.strip();
@@ -111,6 +131,13 @@ public class Sigga extends GhidraScript {
         return signature;
     }
 
+    /**
+     * Given an iterator of instructions, build a string-signature by converting the bytes into a hex format
+     *
+     * @param instructions The instructions to create a signature from
+     * @return The built signature
+     * @throws MemoryAccessException If the instructions are in non-accessible memory
+     */
     private String buildSignatureFromInstructions(InstructionIterator instructions) throws MemoryAccessException {
         StringBuilder signature = new StringBuilder();
 
@@ -133,6 +160,13 @@ public class Sigga extends GhidraScript {
         return signature.toString();
     }
 
+    /**
+     * Recursively refine the signature/make it smaller by removing the last byte and trying to find it util it is not unique anymore
+     * With any valid signature as an input, it will return the smallest possible signature that is still guaranteed to be unique
+     * @param signature The signature to refine
+     * @param functionAddress The function address the signature points to
+     * @return The refined signature
+     */
     private String refineSignature(String signature, Address functionAddress) {
         // Strip trailing whitespaces and wildcards
         signature = cleanSignature(signature);
@@ -154,6 +188,10 @@ public class Sigga extends GhidraScript {
         return signature;
     }
 
+    /**
+     * Create a signature for the function currently selected in the editor and output it
+     * @throws MemoryAccessException If the selected function is inside not-accessible memory
+     */
     private void createSignature() throws MemoryAccessException {
         // Get currently selected function's body
         AddressSetView functionBody = getCurrentFunctionBody();
@@ -186,6 +224,12 @@ public class Sigga extends GhidraScript {
         println(signature);
     }
 
+    /**
+     * Try to find the signature
+     * @param signature The signature to find
+     * @return The first address the signature matches on
+     * @throws InvalidParameterException If the signature has a invalid format
+     */
     private Address findAddressForSignature(String signature) throws InvalidParameterException {
         // See class definition
         ByteSignature byteSignature = new ByteSignature(signature);
@@ -195,6 +239,10 @@ public class Sigga extends GhidraScript {
                 byteSignature.getBytes(), byteSignature.getMask(), true, monitor);
     }
 
+    /**
+     * Finds and outputs the signature
+     * @param signature The signature to find and output
+     */
     private void findSignature(String signature) {
         Address address = null;
         try {
@@ -215,6 +263,10 @@ public class Sigga extends GhidraScript {
         println("Found signature at: " + address);
     }
 
+    /**
+     * The script entry point - This gets called when it's executed
+     * @throws Exception If anything in the script went seriously wrong
+     */
     public void run() throws Exception {
         switch (askChoice("Sigga", "Choose a action to perform",
                 Arrays.asList(
