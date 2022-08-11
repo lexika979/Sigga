@@ -27,6 +27,8 @@ I highly recommend binding Sigga to a shortcut to save yourself a lot of clicks.
 
 ![](https://i.imgur.com/N7kSe4F.png)
 
+Troubleshooting: In case Sigga does not show up in the list, try to create a new script through the UI and immediately delete it again. That should force Ghidra to acknowledge the ghidra_scrits directory.
+
 Done!
 
 ## Sigga in action
