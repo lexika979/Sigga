@@ -221,12 +221,8 @@ public class Sigga extends GhidraScript {
                         "Create signature",
                         "Find signature"
                 ), "Create signature")) {
-            case "Create signature":
-                createSignature();
-                break;
-            case "Find signature":
-                findSignature(askString("Sigga", "Enter signature to find:", ""));
-                break;
+            case "Create signature" -> createSignature();
+            case "Find signature" -> findSignature(askString("Sigga", "Enter signature to find:", ""));
         }
     }
 }
