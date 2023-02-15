@@ -49,7 +49,5 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 ## Known bugs/Issues
 
-Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.
-
-## Contact
-If you have a question that you want do ask me directly, feel free to contact me on Discord: lexika#8734
+- Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.
+- Sometimes it can't find specific signatures. This seems to be a bug in ghidra.
