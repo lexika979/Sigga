@@ -49,5 +49,5 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 ## Known bugs/Issues
 
-- Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.
+- ~~Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.~~ Fixed by @outercloudstudio
 - Sometimes it can't find specific signatures. This seems to be a bug in ghidra.
