@@ -13,6 +13,7 @@ import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.lang.OperandType;
 
 import java.awt.*;
 import java.awt.datatransfer.Clipboard;
@@ -24,7 +25,8 @@ import java.util.List;
 
 public class Sigga extends GhidraScript {
     /**
-     * Helper class to convert a string signature to bytes + mask, also acts as a container for them
+     * Helper class to convert a string signature to bytes + mask, also acts as a
+     * container for them
      */
     private static class ByteSignature {
         public ByteSignature(String signature) throws InvalidParameterException {
@@ -32,8 +34,10 @@ public class Sigga extends GhidraScript {
         }
 
         /**
-         * Parse a string signature (like "56 8B ? ? 06 FF 8B") to arrays representing the actual signature and a mask
-         * This is done, so that we can pass these two arrays directly into currentProgram.getMemory().findBytes()
+         * Parse a string signature (like "56 8B ? ? 06 FF 8B") two arrays representing
+         * the actual signature and a mask
+         * This is done, so that we can pass these two arrays directly into
+         * currentProgram.getMemory().findBytes()
          *
          * @param signature The string-format signature to parse/convert
          * @throws InvalidParameterException If the signature has an invalid format
@@ -48,7 +52,7 @@ public class Sigga extends GhidraScript {
 
             final List<Byte> bytes = new LinkedList<>();
             final List<Byte> mask = new LinkedList<>();
-            for (int i = 0; i < signature.length(); ) {
+            for (int i = 0; i < signature.length();) {
                 // Do not convert wildcards
                 if (signature.charAt(i) == '?') {
                     bytes.add((byte) 0);
@@ -135,27 +139,45 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Given an iterator of instructions, build a string-signature by converting the bytes into a hex format
+     * Given an iterator of instructions, build a string-signature by converting the
+     * bytes into a hex format
      *
      * @param instructions The instructions to create a signature from
      * @return The built signature
-     * @throws MemoryAccessException If the instructions are in non-accessible memory
+     * @throws MemoryAccessException If the instructions are in non-accessible
+     *                               memory
      */
     private String buildSignatureFromInstructions(InstructionIterator instructions) throws MemoryAccessException {
         StringBuilder signature = new StringBuilder();
 
+        Address lastAddress = null;
+
         for (Instruction instruction : instructions) {
-            // It seems that instructions that contain addresses which may change at runtime
-            // are always something else then "fallthrough", so we just do this.
-            // TODO: Do this more properly, like https://github.com/nosoop/ghidra_scripts/blob/master/makesig.py#L41
-            if (instruction.isFallthrough()) {
-                for (byte b : instruction.getBytes()) {
+            Address instructionAddress = instruction.getAddress();
+
+            // An unexpected jump in the instructions was detected, so we should go back and
+            // add wildcards so that no bytes are missed causing the signature to not match
+            if (lastAddress != null && !lastAddress.equals(instructionAddress)) {
+                long offset = instructionAddress.getOffset() - lastAddress.getOffset();
+
+                for (long i = 0; i < offset; i++) {
+                    signature.append("? ");
+                }
+            }
+
+            lastAddress = instructionAddress.add(instruction.getBytes().length);
+
+            int index = 0;
+
+            for (byte b : instruction.getBytes()) {
+                int operandType = instruction.getOperandType(index);
+
+                if ((operandType & OperandType.DYNAMIC) == OperandType.DYNAMIC) {
+                    // Add a wildcard where the bytes may change
+                    signature.append("? ");
+                } else {
                     // %02X = byte -> hex string
                     signature.append(String.format("%02X ", b));
-                }
-            } else {
-                for (byte b : instruction.getBytes()) {
-                    signature.append("? ");
                 }
             }
         }
@@ -164,8 +186,10 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Recursively refine the signature/make it smaller by removing the last byte and trying to find it util it is not unique anymore
-     * With any valid signature as an input, it will return the smallest possible signature that is still guaranteed to be unique
+     * Recursively refine the signature/make it smaller by removing the last byte
+     * and trying to find it util it is not unique anymore
+     * With any valid signature as an input, it will return the smallest possible
+     * signature that is still guaranteed to be unique
      *
      * @param signature       The signature to refine
      * @param functionAddress The function address the signature points to
@@ -193,9 +217,11 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Create a signature for the function currently selected in the editor and output it
+     * Create a signature for the function currently selected in the editor and
+     * output it
      *
-     * @throws MemoryAccessException If the selected function is inside not-accessible memory
+     * @throws MemoryAccessException If the selected function is inside
+     *                               not-accessible memory
      */
     private void createSignature() throws MemoryAccessException {
         // Get currently selected function's body
@@ -212,18 +238,32 @@ public class Sigga extends GhidraScript {
 
         // Generate signature for whole function
         String signature = buildSignatureFromInstructions(instructions);
+        String originalSignature = signature;
 
-        // Try to find it once to make sure the first address found matches the one we generated it from
-        // We know the signature is valid at this point, so no need to catch the InvalidParameterException
-        if (!findAddressForSignature(signature).equals(functionBody.getMinAddress())) {
-            // I don't see what other problem could cause this
-            printerr("Failed to create signature: Function is (most likely) not big enough to create a unique signature");
+        Address address = findAddressForSignature(signature);
+
+        if (address == null) {
+            printerr("Failed to create signature! Generated signature matched no function.");
             return;
         }
 
-        // Try to make the signature as small as possible while still being the first one found
+        // Try to find it once to make sure the first address found matches the one we
+        // generated it from
+        // We know the signature is valid at this point, so no need to catch the
+        // InvalidParameterException
+        if (!address.equals(functionBody.getMinAddress())) {
+            // I don't see what other problem could cause this
+            printerr(
+                    "Failed to create signature: Function is (most likely) not big enough to create a unique signature. Matched "
+                            + address.toString() + " instead.");
+            return;
+        }
+
+        // Try to make the signature as small as possible while still being the first
+        // one found
         // Also strip trailing whitespaces and wildcards
-        // TODO: Make this faster - Depending on the program's size and the size of the signature (function body) this could take quite some time
+        // TODO: Make this faster - Depending on the program's size and the size of the
+        // signature (function body) this could take quite some time
         signature = refineSignature(signature, functionBody.getMinAddress());
 
         // Selecting and copying the signature manually is a chore :)
@@ -234,6 +274,7 @@ public class Sigga extends GhidraScript {
 
     /**
      * Copy the generated signature to the clipboard for ease of use
+     * 
      * @param signature The signature to copy to the clipboard
      */
     private void copySignatureToClipboard(String signature) {
@@ -297,8 +338,8 @@ public class Sigga extends GhidraScript {
         switch (askChoice("Sigga", "Choose a action to perform",
                 Arrays.asList(
                         "Create signature",
-                        "Find signature"
-                ), "Create signature")) {
+                        "Find signature"),
+                "Create signature")) {
             case "Create signature":
                 createSignature();
                 break;
