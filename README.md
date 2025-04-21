@@ -39,7 +39,7 @@ Select any function and press your assigned keybind, and Sigga's UI should pop u
 
 ![](https://i.imgur.com/mVA2oPr.png)
 
-![](https://i.imgur.com/HfhQFxi.png)
+![](https://i.imgur.com/Z4AOOIW.png)
 
 ## Contributing/Bug reporting
 
@@ -51,3 +51,4 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 - ~~Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.~~ Fixed by @outercloudstudio
 - Sometimes it can't find specific signatures. This seems to be a bug in ghidra.
+- Progress not working correctly, stays at 0%.
