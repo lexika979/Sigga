@@ -1,5 +1,5 @@
 //Budget sigmaker for Ghidra (Version 1.1)
-//@author lexika
+//@author lexika, Narmjep
 //@category Functions
 //@keybinding
 //@menupath
@@ -14,11 +14,16 @@ import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressOutOfBoundsException;
+import ghidra.program.model.mem.Memory;
+import ghidra.program.model.mem.MemoryAccessException;
 
 import java.awt.*;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.security.InvalidParameterException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedList;
 import java.util.List;
@@ -289,7 +294,7 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Try to find the signature
+     * Try to find the signature. Used when creating a signature
      *
      * @param signature The signature to find
      * @return The first address the signature matches on
@@ -300,9 +305,254 @@ public class Sigga extends GhidraScript {
         ByteSignature byteSignature = new ByteSignature(signature);
 
         // Try to find the signature
-        return currentProgram.getMemory().findBytes(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
-                byteSignature.getBytes(), byteSignature.getMask(), true, monitor);
+        byte[] bytes = byteSignature.getBytes();
+        byte[] mask = byteSignature.getMask();
+
+        Address address = findBytesManual(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
+                bytes, mask);
+
+        return address;
     }
+
+    /**
+     * Find all addresses matching the signature. Used when searching for a signature
+     * @param signature The signature to find
+     * @return A list of addresses matching the signature
+     * @throws InvalidParameterException
+     */
+    private List<Address> findAllAddressesForSignature(String signature) throws InvalidParameterException {
+        // See class definition
+        ByteSignature byteSignature = new ByteSignature(signature);
+
+        // Try to find the signature
+        byte[] bytes = byteSignature.getBytes();
+        byte[] mask = byteSignature.getMask();
+
+        List<Address> addresses = findAllBytesManual(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
+                bytes, mask);
+
+        return addresses;
+    }
+
+    /**
+     * Verify if the signature matches the bytes at the given address.
+     * @param address The address to verify the signature at
+     * @param byteSignature The signature to verify
+     * @return True if the signature matches the bytes at the address, false otherwise
+     */
+    private boolean verifySignatureMatch(Address address, ByteSignature byteSignature) {
+        if (address == null) {
+            println("No match found.");
+            return true;
+        }
+
+        byte[] pattern = byteSignature.getBytes();
+        byte[] mask = byteSignature.getMask();
+        byte[] memory = new byte[pattern.length];
+    
+        try {
+            currentProgram.getMemory().getBytes(address, memory);
+
+            boolean isMatch = true;
+    
+            for (int i = 0; i < pattern.length; i++) {
+                boolean matches = (mask[i] == 0) || (memory[i] == pattern[i]);
+                String status = matches ? "OK" : "MISMATCH";
+                if (!matches) {
+                    isMatch = false;
+                }
+            }
+            return isMatch;
+        } catch (MemoryAccessException e) {
+            println("Error reading memory at address " + address + ": " + e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Finds the first address matching the signature
+     * This function replaces the former simple call to memory.findBytes() with the signature.
+     * This function uses memory.findBytes() to find an anchor in the pattern (no wildcards, so no mask is needed --> no false positives)
+     * @param start Start address to search from
+     * @param end End address to search to
+     * @param pattern The byte pattern to search for
+     * @param mask The mask to use for the search where 0 = wildcard, 1 = match
+     * @return The first address matching the pattern
+     */
+    private Address findBytesManual(Address start, Address end, byte[] pattern, byte[] mask) {
+        Memory memory = currentProgram.getMemory();
+        Anchor anchor = extractAnchor(pattern, mask);
+    
+        if (anchor == null) {
+            println("No anchor found in pattern.");
+            return null;
+        }
+    
+        Address cur = start;
+        long totalRange = end.subtract(start);
+        monitor.initialize(totalRange);
+    
+        while (cur.compareTo(end) <= 0) {
+            if (monitor.isCancelled()) {
+                println("Search cancelled.");
+                return null;
+            }
+    
+            try {
+                Address anchorAddr = memory.findBytes(
+                    cur, end, anchor.anchorBytes, null, true, monitor);
+    
+                if (anchorAddr == null) {
+                    println("No anchor matches found.");
+                    return null;
+                }
+    
+                // backtrack to the beginning of the full pattern
+                Address potentialStart = anchorAddr.subtract(anchor.offsetInPattern);
+    
+                // verify full match
+                byte[] mem = new byte[pattern.length];
+                memory.getBytes(potentialStart, mem);
+    
+                boolean match = true;
+                for (int i = 0; i < pattern.length; i++) {
+                    if (mask[i] != 0 && mem[i] != pattern[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+    
+                if (match) {
+                    return potentialStart;
+                }
+    
+                // if no match, advance just after this anchor and keep going
+                cur = anchorAddr.add(1);
+            } catch (Exception e) {
+                // skip bad memory or address issues
+                cur = cur.add(1);
+            }
+    
+            monitor.incrementProgress(1);
+        }
+    
+        println("No optimized match found.");
+        return null;
+    }
+
+    /**
+     * A series of bytes that are part of a signature and contain no wildcards
+     */
+    private class Anchor {
+        /**
+         * The offset in the pattern where the anchor starts
+         */
+        int offsetInPattern;
+        byte[] anchorBytes;
+    }
+    
+    /**
+     * Retrieves the first anchor in the pattern
+     * @param pattern
+     * @param mask
+     * @return
+     */
+    private Anchor extractAnchor(byte[] pattern, byte[] mask) {
+        int start = -1;
+        int end = -1;
+    
+        for (int i = 0; i < mask.length; i++) {
+            if (mask[i] != 0) {
+                if (start == -1) start = i;
+                end = i;
+            } else if (start != -1) {
+                break; // only take the first contiguous non-wildcard block
+            }
+        }
+    
+        if (start == -1) return null; // all wildcards? nothing to anchor
+    
+        byte[] anchorBytes = Arrays.copyOfRange(pattern, start, end + 1);
+        Anchor anchor = new Anchor();
+        anchor.offsetInPattern = start;
+        anchor.anchorBytes = anchorBytes;
+        return anchor;
+    }
+
+    /**
+     * Same as {@link #findBytesManual} but returns all matches
+     * @param start Start address to search from
+     * @param end End address to search to
+     * @param pattern The byte pattern to search for
+     * @param mask The mask to use for the search where 0 = wildcard, 1 = match
+     * @return A list of addresses matching the pattern
+     */
+    private List<Address> findAllBytesManual(Address start, Address end, byte[] pattern, byte[] mask) {
+        Memory memory = currentProgram.getMemory();
+        Anchor anchor = extractAnchor(pattern, mask);
+
+        List<Address> results = new ArrayList<>();
+
+        if (anchor == null) {
+            println("No anchor found in pattern.");
+            return results;
+        }
+
+        Address cur = start;
+        long totalRange = end.subtract(start);
+        monitor.initialize(totalRange);
+
+        while (cur.compareTo(end) <= 0) {
+            if (monitor.isCancelled()) {
+                println("Search cancelled.");
+                return results;
+            }
+
+            try {
+                Address anchorAddr = memory.findBytes(
+                    cur, end, anchor.anchorBytes, null, true, monitor);
+
+                if (anchorAddr == null) {
+                    break;
+                }
+
+                Address potentialStart = anchorAddr.subtract(anchor.offsetInPattern);
+
+                // Check if the full pattern fits in memory range
+                if (potentialStart.compareTo(start) < 0 || 
+                    potentialStart.add(pattern.length).compareTo(end) > 0) {
+                    cur = anchorAddr.add(1);
+                    continue;
+                }
+
+                byte[] mem = new byte[pattern.length];
+                memory.getBytes(potentialStart, mem);
+
+                boolean match = true;
+                for (int i = 0; i < pattern.length; i++) {
+                    if (mask[i] != 0 && mem[i] != pattern[i]) {
+                        match = false;
+                        break;
+                    }
+                }
+
+                if (match) {
+                    results.add(potentialStart);
+                }
+
+                // Move past the current anchor to keep searching
+                cur = anchorAddr.add(1);
+            } catch (Exception e) {
+                cur = cur.add(1); // On failure, advance to the next byte
+            }
+
+            monitor.incrementProgress(1);
+        }
+
+        println("Total matches found: " + results.size());
+        return results;
+    }
+ 
 
     /**
      * Finds and outputs the signature
@@ -310,23 +560,37 @@ public class Sigga extends GhidraScript {
      * @param signature The signature to find and output
      */
     private void findSignature(String signature) {
-        Address address = null;
+        List<Address> addresses = null;
         try {
-            address = findAddressForSignature(signature);
+            addresses = findAllAddressesForSignature(signature);
+
+            if (addresses.isEmpty()) {
+                println("Signature not found");
+                return;
+            }
+
+            int totalMatches = addresses.size();
+
+            for (int i = 0; i < totalMatches; i++) {
+                Address addr = addresses.get(i);
+                println(" --------- Match " + (i + 1) + "/" + totalMatches + ": " + addr);
+                if (!verifySignatureMatch(addr, new ByteSignature(signature))) {
+                    /*
+                     * This should never happen.
+                     * If it does, findAllBytesManual is not working correctly,
+                     * and findBytesManual probably isn't either 
+                     */
+                    println("Signature found, but not valid");
+                } else {
+                    if (!currentProgram.getFunctionManager().isInFunction(addr)) {
+                        println("Warning: The address found is not inside a function");
+                    }
+                }
+            }
         } catch (InvalidParameterException exception) {
             printerr("Failed to find signature: " + exception.getMessage());
         }
 
-        if (address == null) {
-            println("Signature not found");
-            return;
-        }
-
-        if (!currentProgram.getFunctionManager().isInFunction(address)) {
-            println("Warning: The address found is not inside a function");
-        }
-
-        println("Found signature at: " + address);
     }
 
     /**
