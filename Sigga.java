@@ -274,11 +274,6 @@ public class Sigga extends GhidraScript {
     private boolean isSignatureUniqueInBinary(String signature) throws CancelledException {
         if (signature.isEmpty()) return false;
         ByteSignature sig = new ByteSignature(signature);
-        //Memory mem = currentProgram.getMemory();
-        //Address firstMatch = mem.findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
-        //if (firstMatch == null) return false;
-        //Address secondMatch = mem.findBytes(firstMatch.add(1), sig.bytes, sig.mask, true, monitor);
-        //return (secondMatch == null);
         List<Address> matches = findAllAddressesForSignature(signature);
         if (matches.isEmpty()) {
             return false;
@@ -311,9 +306,8 @@ public class Sigga extends GhidraScript {
                 println(" --------- Match " + (i + 1) + "/" + totalMatches + ": " + addr);
                 if (!verifySignatureMatch(addr, new ByteSignature(signature))) {
                     /*
-                     * This should never happen.
-                     * If it does, findAllBytesManual is not working correctly,
-                     * and findBytesManual probably isn't either 
+                     ! This should never happen.
+                     ! If it does, findAllBytesManual is not working correctly!
                      */
                     println("Signature found, but not valid");
                 } else {
@@ -396,76 +390,6 @@ public class Sigga extends GhidraScript {
         }
     }
 
-    /**
-     * Finds the first address matching the signature
-     * This function replaces the former simple call to memory.findBytes() with the signature.
-     * This function uses memory.findBytes() to find an anchor in the pattern (no wildcards, so no mask is needed --> no false positives)
-     * @param start Start address to search from
-     * @param end End address to search to
-     * @param pattern The byte pattern to search for
-     * @param mask The mask to use for the search where 0 = wildcard, 1 = match
-     * @return The first address matching the pattern
-     */
-    private Address findBytesManual(Address start, Address end, byte[] pattern, byte[] mask) {
-        Memory memory = currentProgram.getMemory();
-        Anchor anchor = extractAnchor(pattern, mask);
-    
-        if (anchor == null) {
-            println("No anchor found in pattern.");
-            return null;
-        }
-    
-        Address cur = start;
-        long totalRange = end.subtract(start);
-        monitor.initialize(totalRange);
-    
-        while (cur.compareTo(end) <= 0) {
-            if (monitor.isCancelled()) {
-                println("Search cancelled.");
-                return null;
-            }
-    
-            try {
-                Address anchorAddr = memory.findBytes(
-                    cur, end, anchor.anchorBytes, null, true, monitor);
-    
-                if (anchorAddr == null) {
-                    println("No anchor matches found.");
-                    return null;
-                }
-    
-                // backtrack to the beginning of the full pattern
-                Address potentialStart = anchorAddr.subtract(anchor.offsetInPattern);
-    
-                // verify full match
-                byte[] mem = new byte[pattern.length];
-                memory.getBytes(potentialStart, mem);
-    
-                boolean match = true;
-                for (int i = 0; i < pattern.length; i++) {
-                    if (mask[i] != 0 && mem[i] != pattern[i]) {
-                        match = false;
-                        break;
-                    }
-                }
-    
-                if (match) {
-                    return potentialStart;
-                }
-    
-                // if no match, advance just after this anchor and keep going
-                cur = anchorAddr.add(1);
-            } catch (Exception e) {
-                // skip bad memory or address issues
-                cur = cur.add(1);
-            }
-    
-            monitor.incrementProgress(1);
-        }
-    
-        println("No optimized match found.");
-        return null;
-    }
 
     /**
      * A series of bytes that are part of a signature and contain no wildcards
@@ -507,7 +431,9 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Same as {@link #findBytesManual} but returns all matches
+     * Finds all addresses that match the signature
+     * This function replaces the former simple call to memory.findBytes() which led to false positives
+     * This function uses memory.findBytes() to find an anchor in the pattern instead (no wildcards, so no mask is needed --> no false positives)
      * @param start Start address to search from
      * @param end End address to search to
      * @param pattern The byte pattern to search for
@@ -576,9 +502,6 @@ public class Sigga extends GhidraScript {
             monitor.incrementProgress(1);
         }
 
-        println("Total matches found: " + results.size());
         return results;
     }
-
-
 }
