@@ -50,6 +50,11 @@ I **highly** appreciate anyone that wants to contribute by fixing bugs or adding
 
 Feel free to open a pull request, but please make sure your changes/new code are properly documented and formatted :)
 
+## Credits
+- **lexika** - Original author and creator of Sigga.
+- **[@Krixx1337](https://github.com/Krixx1337)** - Major architectural overhaul, adding the XRef fallback, sliding window search, and advanced stability analysis.
+- **outercloudstudio** - Fixed a bug with the original wildcard placement.
+
 ## Known bugs/Issues
 
 - None.
