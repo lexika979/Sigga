@@ -235,6 +235,7 @@ public class Sigga extends GhidraScript {
     /**
      * Determines if an instruction is "stable" enough to be included in a signature.
      * Unstable instructions (jumps, calls, stack operations) are wildcarded.
+     * This version is compatible with both x86 and x64 architectures.
      *
      * @param instruction The instruction to check.
      * @return True if the instruction is stable.
@@ -243,18 +244,22 @@ public class Sigga extends GhidraScript {
         if (instruction.getFlowType().isJump() || instruction.getFlowType().isCall()) {
             return false;
         }
+
         for (int i = 0; i < instruction.getNumOperands(); i++) {
             Object[] opObjects = instruction.getOpObjects(i);
             for (Object obj : opObjects) {
                 if (obj instanceof Register) {
                     Register reg = (Register) obj;
                     String regName = reg.getName().toUpperCase();
-                    if (regName.equals("RSP") || regName.equals("EBP")) {
+                    // Check for all common stack and base pointer register names for x86/x64.
+                    if (regName.equals("RSP") || regName.equals("ESP") ||  // Stack Pointers
+                        regName.equals("RBP") || regName.equals("EBP")) {  // Base Pointers
                         return false;
                     }
                 }
             }
         }
+        
         return true;
     }
 
