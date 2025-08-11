@@ -52,4 +52,4 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 ## Known bugs/Issues
 
-- **Major Overhaul by [@Krixx1337](https://github.com/Krixx1337):** This version resolves long-standing issues with signature quality and performance. The bugs regarding suboptimal wildcards and the inability to find signatures for complex functions have been fixed by the new algorithms.
+- None.
