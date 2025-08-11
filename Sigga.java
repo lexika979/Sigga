@@ -1,5 +1,7 @@
-//Budget sigmaker for Ghidra (Version 1.1)
-//@author lexika, Narmjep
+// A massively improved sigmaker for Ghidra
+// This version includes a fast "Sliding Window" algorithm and a powerful "XRef Fallback"
+// to create reliable signatures for even the most complex, non-unique functions.
+//@author lexika, Krixx1337, Narmjep
 //@category Functions
 //@keybinding
 //@menupath
@@ -7,311 +9,336 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.listing.Function;
-import ghidra.program.model.listing.FunctionManager;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
-import ghidra.program.model.mem.MemoryAccessException;
-import ghidra.program.model.lang.OperandType;
-import ghidra.program.model.address.Address;
-import ghidra.program.model.address.AddressOutOfBoundsException;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.lang.Register;
+import ghidra.util.exception.CancelledException;
 
-import java.awt.*;
+import java.awt.Toolkit;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.security.InvalidParameterException;
-import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.ArrayList;
+import java.util.Arrays;
 
 public class Sigga extends GhidraScript {
+
+    // --- CONFIGURATION ---
+    private static final int MAX_INSTRUCTIONS_TO_SCAN = 256;
+    private static final int MIN_WINDOW_BYTES = 16;
+    private static final int MAX_WINDOW_BYTES = 64;
+    private static final int WINDOW_STEP_BYTES = 8;
+    private static final int XREF_SIG_INSTRUCTIONS = 8; // How many instructions to use for an XRef signature.
+
     /**
-     * Helper class to convert a string signature to bytes + mask, also acts as a
-     * container for them
+     * Helper class to convert a string signature to bytes + mask.
      */
     private static class ByteSignature {
-        public ByteSignature(String signature) throws InvalidParameterException {
+        private byte[] bytes;
+        private byte[] mask;
+
+        public ByteSignature(String signature) {
             parseSignature(signature);
         }
 
         /**
-         * Parse a string signature (like "56 8B ? ? 06 FF 8B") two arrays representing
-         * the actual signature and a mask
-         * This is done, so that we can pass these two arrays directly into
-         * currentProgram.getMemory().findBytes()
+         * Parses a string signature (like "56 8B ? ? 06") into byte and mask arrays.
          *
-         * @param signature The string-format signature to parse/convert
-         * @throws InvalidParameterException If the signature has an invalid format
+         * @param signature The string-format signature to parse.
+         * @throws IllegalArgumentException If the signature has an invalid format.
          */
-        private void parseSignature(String signature) throws InvalidParameterException {
-            // Remove all whitespaces for easier parsing
-            signature = signature.replaceAll(" ", "");
-
-            if (signature.isEmpty()) {
-                throw new InvalidParameterException("Signature cannot be empty");
+        private void parseSignature(String signature) throws IllegalArgumentException {
+            String cleanSignature = signature.replaceAll("\\s", "");
+            if (cleanSignature.isEmpty()) {
+                throw new IllegalArgumentException("Signature cannot be empty.");
             }
 
-            final List<Byte> bytes = new LinkedList<>();
-            final List<Byte> mask = new LinkedList<>();
-            for (int i = 0; i < signature.length();) {
-                // Do not convert wildcards
-                if (signature.charAt(i) == '?') {
-                    bytes.add((byte) 0);
-                    mask.add((byte) 0);
+            List<Byte> byteList = new LinkedList<>();
+            List<Byte> maskList = new LinkedList<>();
 
+            for (int i = 0; i < cleanSignature.length();) {
+                char character = cleanSignature.charAt(i);
+                if (character == '?') {
+                    byteList.add((byte) 0x00);
+                    maskList.add((byte) 0x00);
                     i++;
                     continue;
                 }
 
                 try {
-                    // Try to convert the hex string representation of the byte to the actual byte
-                    bytes.add(Integer.decode("0x" + signature.substring(i, i + 2)).byteValue());
-                } catch (NumberFormatException exception) {
-                    throw new InvalidParameterException(exception.getMessage());
+                    byte value = (byte) Integer.parseInt(cleanSignature.substring(i, i + 2), 16);
+                    byteList.add(value);
+                    maskList.add((byte) 0xFF);
+                    i += 2;
+                } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
+                    throw new IllegalArgumentException("Invalid hex character or wildcard in signature.", e);
                 }
-
-                // Not a wildcard
-                mask.add((byte) 1);
-
-                i += 2;
             }
+            this.bytes = toByteArray(byteList);
+            this.mask = toByteArray(maskList);
+        }
 
-            // Lists -> Member arrays
-            this.bytes = new byte[bytes.size()];
-            this.mask = new byte[mask.size()];
-            for (int i = 0; i < bytes.size(); i++) {
-                this.bytes[i] = bytes.get(i);
-                this.mask[i] = mask.get(i);
+        private byte[] toByteArray(List<Byte> list) {
+            byte[] array = new byte[list.size()];
+            for (int i = 0; i < list.size(); i++) {
+                array[i] = list.get(i);
             }
+            return array;
         }
 
-        public byte[] getBytes() {
-            return bytes;
-        }
-
-        public byte[] getMask() {
-            return mask;
-        }
-
-        private byte[] bytes;
-        private byte[] mask;
+        public byte[] getBytes() { return bytes; }
+        public byte[] getMask() { return mask; }
     }
 
     /**
-     * Get the function body of the currently selected function in the GUI
-     *
-     * @return The body of the selected function, otherwise null
+     * The script entry point.
      */
-    private AddressSetView getCurrentFunctionBody() {
-        FunctionManager functionManager = currentProgram.getFunctionManager();
-        if (currentLocation == null) {
-            return null;
+    @Override
+    public void run() throws Exception {
+        String action = askChoice("Sigga", "Choose an action:", Arrays.asList("Create Signature", "Find Signature"), "Create Signature");
+        if ("Create Signature".equals(action)) {
+            createSignature();
+        } else if ("Find Signature".equals(action)) {
+            findSignature();
         }
-
-        Address address = currentLocation.getAddress();
-        if (address == null) {
-            return null;
-        }
-
-        Function function = functionManager.getFunctionContaining(address);
+    }
+    
+    /**
+     * Main function to create a signature for the function at the current cursor location.
+     * Uses a two-phase approach: direct scan, then XRef fallback scan.
+     */
+    private void createSignature() throws MemoryAccessException, CancelledException {
+        Function function = getFunctionContaining(currentLocation.getAddress());
         if (function == null) {
-            return null;
+            printerr("No function selected.");
+            return;
         }
 
-        return function.getBody();
-    }
-
-    /**
-     * Remove useless whitespaces and trailing wildcards
-     *
-     * @param signature The signature to clean
-     * @return The cleaned signature
-     */
-    private String cleanSignature(String signature) {
-        // Remove trailing whitespace
-        signature = signature.strip();
-
-        if (signature.endsWith("?")) {
-            // Use recursion to remove wildcards at end
-            return cleanSignature(signature.substring(0, signature.length() - 1));
+        println("Phase 1: Scanning for a direct signature in: " + function.getName());
+        
+        List<String> featureVector = buildFeatureVector(function, MAX_INSTRUCTIONS_TO_SCAN);
+        if (featureVector.size() < MIN_WINDOW_BYTES) {
+            println("Function is too small for direct scan, proceeding to XRef scan.");
+        } else {
+            // Use a sliding window to find the first unique pattern within the function.
+            for (int windowSize = MIN_WINDOW_BYTES; windowSize <= MAX_WINDOW_BYTES; windowSize += WINDOW_STEP_BYTES) {
+                monitor.checkCancelled();
+                monitor.setMessage(String.format("Sigga: Searching with window size %d...", windowSize));
+                for (int offset = 0; offset <= featureVector.size() - windowSize; offset++) {
+                    monitor.checkCancelled();
+                    List<String> window = featureVector.subList(offset, offset + windowSize);
+                    String signature = String.join(" ", window);
+                    if (isSignatureUniqueInBinary(signature)) {
+                        String finalOutput = String.format("Signature: \"%s\" (Offset: %d)", signature, offset);
+                        copyToClipboard(signature);
+                        println("Found unique direct signature!");
+                        println(finalOutput + " - Signature text copied to clipboard.");
+                        return;
+                    }
+                }
+            }
         }
-
-        return signature;
+        
+        // If Phase 1 fails, attempt to find a signature via a cross-reference.
+        println("Phase 1 failed. Proceeding to Phase 2: Signature by Cross-Reference (XRef).");
+        tryXRefSignature(function);
     }
-
+    
     /**
-     * Given an iterator of instructions, build a string-signature by converting the
-     * bytes into a hex format
+     * Fallback method to find a signature for a function's CALLER.
      *
-     * @param instructions The instructions to create a signature from
-     * @return The built signature
-     * @throws MemoryAccessException If the instructions are in non-accessible
-     *                               memory
+     * @param function The function that could not be signed directly.
      */
-    private String buildSignatureFromInstructions(InstructionIterator instructions) throws MemoryAccessException {
-        StringBuilder signature = new StringBuilder();
+    private void tryXRefSignature(Function function) throws MemoryAccessException, CancelledException {
+        Reference[] refs = getReferencesTo(function.getEntryPoint());
+        for (Reference ref : refs) {
+            monitor.checkCancelled();
+            Address refAddr = ref.getFromAddress();
+            Instruction refInstr = getInstructionAt(refAddr);
+            
+            MemoryBlock block = getMemoryBlock(refAddr);
+            if (refInstr == null || !refInstr.getFlowType().isCall() || block == null || !block.isExecute()) {
+                continue;
+            }
 
-        Address lastAddress = null;
-
+            // Create a signature from the instructions leading up to the CALL.
+            List<Instruction> xrefInstructions = new LinkedList<>();
+            Instruction current = refInstr;
+            for (int i = 0; i < XREF_SIG_INSTRUCTIONS && current != null; i++) {
+                xrefInstructions.add(current);
+                current = current.getPrevious();
+            }
+            Collections.reverse(xrefInstructions);
+            
+            String signature = buildFeatureString(xrefInstructions);
+            if (isSignatureUniqueInBinary(signature)) {
+                String finalOutput = String.format("Signature: \"%s\" (Found via XRef from %s)", signature, refAddr);
+                copyToClipboard(signature);
+                println("Found unique XRef signature!");
+                println(finalOutput + " - This signature finds the CALLER, not the function itself.");
+                return;
+            }
+        }
+        printerr("Failed to find any unique signature for this function, even via XRefs.");
+    }
+    
+    /**
+     * Converts a large chunk of a function into a "feature vector" of byte tokens.
+     *
+     * @param function The function to analyze.
+     * @param limit The maximum number of instructions to process.
+     * @return A list of strings, where each string is a hex byte ("XX") or a wildcard ("?").
+     */
+    private List<String> buildFeatureVector(Function function, int limit) throws MemoryAccessException {
+        List<String> tokens = new LinkedList<>();
+        InstructionIterator iter = currentProgram.getListing().getInstructions(function.getBody(), true);
+        while (iter.hasNext() && tokens.size() < (limit * 16)) { // Heuristic limit
+            tokens.addAll(instructionToTokens(iter.next()));
+        }
+        return tokens;
+    }
+    
+    /**
+     * Converts a list of instructions into a single signature string.
+     */
+    private String buildFeatureString(List<Instruction> instructions) throws MemoryAccessException {
+        List<String> tokens = new LinkedList<>();
         for (Instruction instruction : instructions) {
-            Address instructionAddress = instruction.getAddress();
+            tokens.addAll(instructionToTokens(instruction));
+        }
+        return String.join(" ", tokens);
+    }
 
-            // An unexpected jump in the instructions was detected, so we should go back and
-            // add wildcards so that no bytes are missed causing the signature to not match
-            if (lastAddress != null && !lastAddress.equals(instructionAddress)) {
-                long offset = instructionAddress.getOffset() - lastAddress.getOffset();
-
-                for (long i = 0; i < offset; i++) {
-                    signature.append("? ");
-                }
-            }
-
-            lastAddress = instructionAddress.add(instruction.getBytes().length);
-
-            int index = 0;
-
+    /**
+     * Converts a single instruction into a list of byte tokens.
+     */
+    private List<String> instructionToTokens(Instruction instruction) throws MemoryAccessException {
+        List<String> tokens = new LinkedList<>();
+        if (isInstructionStableForSignature(instruction)) {
             for (byte b : instruction.getBytes()) {
-                int operandType = instruction.getOperandType(index);
+                tokens.add(String.format("%02X", b));
+            }
+        } else {
+            for (int i = 0; i < instruction.getLength(); i++) {
+                tokens.add("?");
+            }
+        }
+        return tokens;
+    }
 
-                if ((operandType & OperandType.DYNAMIC) == OperandType.DYNAMIC) {
-                    // Add a wildcard where the bytes may change
-                    signature.append("? ");
-                } else {
-                    // %02X = byte -> hex string
-                    signature.append(String.format("%02X ", b));
+    /**
+     * Determines if an instruction is "stable" enough to be included in a signature.
+     * Unstable instructions (jumps, calls, stack operations) are wildcarded.
+     * This version is compatible with both x86 and x64 architectures.
+     *
+     * @param instruction The instruction to check.
+     * @return True if the instruction is stable.
+     */
+    private boolean isInstructionStableForSignature(Instruction instruction) {
+        if (instruction.getFlowType().isJump() || instruction.getFlowType().isCall()) {
+            return false;
+        }
+
+        for (int i = 0; i < instruction.getNumOperands(); i++) {
+            Object[] opObjects = instruction.getOpObjects(i);
+            for (Object obj : opObjects) {
+                if (obj instanceof Register) {
+                    Register reg = (Register) obj;
+                    String regName = reg.getName().toUpperCase();
+                    // Check for all common stack and base pointer register names for x86/x64.
+                    if (regName.equals("RSP") || regName.equals("ESP") ||  // Stack Pointers
+                        regName.equals("RBP") || regName.equals("EBP")) {  // Base Pointers
+                        return false;
+                    }
                 }
             }
         }
-
-        return signature.toString();
+        
+        return true;
     }
 
     /**
-     * Recursively refine the signature/make it smaller by removing the last byte
-     * and trying to find it util it is not unique anymore
-     * With any valid signature as an input, it will return the smallest possible
-     * signature that is still guaranteed to be unique
+     * Scans the entire program memory to check if a signature is unique.
      *
-     * @param signature       The signature to refine
-     * @param functionAddress The function address the signature points to
-     * @return The refined signature
+     * @param signature The signature to test.
+     * @return True if exactly one match is found.
      */
-    private String refineSignature(String signature, Address functionAddress) {
-        // Strip trailing whitespaces and wildcards
-        signature = cleanSignature(signature);
-
-        // Remove last byte
-        String newSignature = signature.substring(0, signature.length() - 2);
-
-        // Try to find the new signature
-        // We know the signature is valid and will at least be found once,
-        // so no need to catch the InvalidParameterException or check for null
-        Address foundAddress = findAddressForSignature(newSignature);
-
-        // If the new signature is still unique, recursively refine it more
-        if (foundAddress.equals(functionAddress)) {
-            return refineSignature(newSignature, functionAddress);
+    private boolean isSignatureUniqueInBinary(String signature) throws CancelledException {
+        if (signature.isEmpty()) return false;
+        ByteSignature sig = new ByteSignature(signature);
+        //Memory mem = currentProgram.getMemory();
+        //Address firstMatch = mem.findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
+        //if (firstMatch == null) return false;
+        //Address secondMatch = mem.findBytes(firstMatch.add(1), sig.bytes, sig.mask, true, monitor);
+        //return (secondMatch == null);
+        List<Address> matches = findAllAddressesForSignature(signature);
+        if (matches.isEmpty()) {
+            return false;
         }
+        if (matches.size() > 1) {
+            return false;
+        }
+        Address firstMatch = matches.get(0);
+        return true;
+    }
+    
+    /**
+     * Prompts the user for a signature and finds its location in memory.
+     */
+    private void findSignature() {
+        try {
+            String signature = askString("Find Signature", "Enter signature:");
+            List<Address> addresses = null;
+            addresses = findAllAddressesForSignature(signature);
 
-        // We cannot refine the signature anymore without making it not unique
-        return signature;
+            if (addresses.isEmpty()) {
+                println("Signature not found");
+                return;
+            }
+
+            int totalMatches = addresses.size();
+
+            for (int i = 0; i < totalMatches; i++) {
+                Address addr = addresses.get(i);
+                println(" --------- Match " + (i + 1) + "/" + totalMatches + ": " + addr);
+                if (!verifySignatureMatch(addr, new ByteSignature(signature))) {
+                    /*
+                     * This should never happen.
+                     * If it does, findAllBytesManual is not working correctly,
+                     * and findBytesManual probably isn't either 
+                     */
+                    println("Signature found, but not valid");
+                } else {
+                    if (!currentProgram.getFunctionManager().isInFunction(addr)) {
+                        println("Warning: The address found is not inside a function");
+                    }
+                }
+            }
+        } catch (Exception e) {
+            printerr("Error: " + e.getMessage());
+        }
     }
 
     /**
-     * Create a signature for the function currently selected in the editor and
-     * output it
+     * Copies a string to the system clipboard.
      *
-     * @throws MemoryAccessException If the selected function is inside
-     *                               not-accessible memory
+     * @param text The text to copy.
      */
-    private void createSignature() throws MemoryAccessException {
-        // Get currently selected function's body
-        AddressSetView functionBody = getCurrentFunctionBody();
-
-        // If we have no function selected, fail
-        if (functionBody == null) {
-            printerr("Failed to create signature: No function selected");
-            return;
-        }
-
-        // Get instructions for current function
-        InstructionIterator instructions = currentProgram.getListing().getInstructions(functionBody, true);
-
-        // Generate signature for whole function
-        String signature = buildSignatureFromInstructions(instructions);
-        String originalSignature = signature;
-
-        Address address = findAddressForSignature(signature);
-
-        if (address == null) {
-            printerr("Failed to create signature! Generated signature matched no function.");
-            return;
-        }
-
-        // Try to find it once to make sure the first address found matches the one we
-        // generated it from
-        // We know the signature is valid at this point, so no need to catch the
-        // InvalidParameterException
-        if (!address.equals(functionBody.getMinAddress())) {
-            // I don't see what other problem could cause this
-            printerr(
-                    "Failed to create signature: Function is (most likely) not big enough to create a unique signature. Matched "
-                            + address.toString() + " instead.");
-            return;
-        }
-
-        // Try to make the signature as small as possible while still being the first
-        // one found
-        // Also strip trailing whitespaces and wildcards
-        // TODO: Make this faster - Depending on the program's size and the size of the
-        // signature (function body) this could take quite some time
-        signature = refineSignature(signature, functionBody.getMinAddress());
-
-        // Selecting and copying the signature manually is a chore :)
-        copySignatureToClipboard(signature);
-
-        println(signature + " (Copied to clipboard)");
-    }
-
-    /**
-     * Copy the generated signature to the clipboard for ease of use
-     * 
-     * @param signature The signature to copy to the clipboard
-     */
-    private void copySignatureToClipboard(String signature) {
-        StringSelection selection = new StringSelection(signature);
-
+    private void copyToClipboard(String text) {
         try {
             Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-            clipboard.setContents(selection, selection);
-        } catch (AWTError | IllegalStateException exception) {
-            println("Warning: Failed to copy signature to clipboard: " + exception.getMessage());
+            clipboard.setContents(new StringSelection(text), null);
+        } catch (Exception e) {
+            printerr("Warning: Could not copy to clipboard. " + e.getMessage());
         }
-    }
-
-    /**
-     * Try to find the signature. Used when creating a signature
-     *
-     * @param signature The signature to find
-     * @return The first address the signature matches on
-     * @throws InvalidParameterException If the signature has a invalid format
-     */
-    private Address findAddressForSignature(String signature) throws InvalidParameterException {
-        // See class definition
-        ByteSignature byteSignature = new ByteSignature(signature);
-
-        // Try to find the signature
-        byte[] bytes = byteSignature.getBytes();
-        byte[] mask = byteSignature.getMask();
-
-        Address address = findBytesManual(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
-                bytes, mask);
-
-        return address;
     }
 
     /**
@@ -552,64 +579,6 @@ public class Sigga extends GhidraScript {
         println("Total matches found: " + results.size());
         return results;
     }
- 
 
-    /**
-     * Finds and outputs the signature
-     *
-     * @param signature The signature to find and output
-     */
-    private void findSignature(String signature) {
-        List<Address> addresses = null;
-        try {
-            addresses = findAllAddressesForSignature(signature);
 
-            if (addresses.isEmpty()) {
-                println("Signature not found");
-                return;
-            }
-
-            int totalMatches = addresses.size();
-
-            for (int i = 0; i < totalMatches; i++) {
-                Address addr = addresses.get(i);
-                println(" --------- Match " + (i + 1) + "/" + totalMatches + ": " + addr);
-                if (!verifySignatureMatch(addr, new ByteSignature(signature))) {
-                    /*
-                     * This should never happen.
-                     * If it does, findAllBytesManual is not working correctly,
-                     * and findBytesManual probably isn't either 
-                     */
-                    println("Signature found, but not valid");
-                } else {
-                    if (!currentProgram.getFunctionManager().isInFunction(addr)) {
-                        println("Warning: The address found is not inside a function");
-                    }
-                }
-            }
-        } catch (InvalidParameterException exception) {
-            printerr("Failed to find signature: " + exception.getMessage());
-        }
-
-    }
-
-    /**
-     * The script entry point - This gets called when it's executed
-     *
-     * @throws Exception If anything in the script went seriously wrong
-     */
-    public void run() throws Exception {
-        switch (askChoice("Sigga", "Choose a action to perform",
-                Arrays.asList(
-                        "Create signature",
-                        "Find signature"),
-                "Create signature")) {
-            case "Create signature":
-                createSignature();
-                break;
-            case "Find signature":
-                findSignature(askString("Sigga", "Enter signature to find:", ""));
-                break;
-        }
-    }
 }

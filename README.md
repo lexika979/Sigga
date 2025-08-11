@@ -1,14 +1,17 @@
 # Sigga - sigmaker for Ghidra
 *The name "Sigga" is a mix of the german word "Digga" (roughly translates to "brother"), and "Signature"*
 
-Sigga is a minimal Ghidra script to create and find function signatures. It is well documented and easily maintainable.
+Sigga is a robust Ghidra script to create and find function signatures. It is well documented and easily maintainable.
 
 ## Features
-It contains the core functionality of [the IDA Pro plugin equivalent](https://github.com/ajkhoury/SigMaker-x64) and some extras for the user's convenience.
+This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
 - Create and find function signatures
 - Signatures will automatically be copied to the clipboard once created
-- Always creates the smallest possible signature
+- **Fast & Efficient 'Sliding Window' Search:** A modern algorithm finds the smallest possible signature and is exponentially faster on large binaries than the original version.
+- **[NEW] Signature by Cross-Reference (XRef) Fallback:** If a function's code is too generic to be unique (like a compiler-generated `memcpy`), Sigga will automatically create a signature for the code that *calls* it. This allows it to succeed where many other sigmakers fail.
+- **[NEW] Intelligent Stability Analysis:** The logic for what to wildcard is now much smarter, including static data references (`[RIP + disp]`) to create far more robust signatures that are more likely to survive game updates.
+- **[NEW] Professional Offset Signatures:** The script now produces industry-standard signatures with offsets, avoiding problematic leading wildcards.
 
 ## Installation
 To install Sigga, simply [download the latest release](https://github.com/lexika979/Sigga/releases) and put *Sigga.java* inside C:/Users/(your username)/ghidra_scripts. If the folder does not exist yet, create it first. - That's it!
@@ -49,6 +52,4 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 ## Known bugs/Issues
 
-- ~~Currently, the way I am placing wildcards is suboptimal. It may wildcard more instructions then actually needed.~~ Fixed by @outercloudstudio
-- Sometimes it can't find specific signatures. This seems to be a bug in ghidra.
-- Progress not working correctly, stays at 0%.
+- Progress indicator not working correctly, stays at 0%.
