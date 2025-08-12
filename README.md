@@ -52,4 +52,4 @@ Feel free to open a pull request, but please make sure your changes/new code are
 
 ## Known bugs/Issues
 
-- Progress indicator not working correctly, stays at 0%.
+- None

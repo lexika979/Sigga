@@ -274,7 +274,7 @@ public class Sigga extends GhidraScript {
     private boolean isSignatureUniqueInBinary(String signature) throws CancelledException {
         if (signature.isEmpty()) return false;
         ByteSignature sig = new ByteSignature(signature);
-        List<Address> matches = findAllAddressesForSignature(signature);
+        List<Address> matches = findAllAddressesForSignature(signature, false);
         if (matches.isEmpty()) {
             return false;
         }
@@ -292,7 +292,7 @@ public class Sigga extends GhidraScript {
         try {
             String signature = askString("Find Signature", "Enter signature:");
             List<Address> addresses = null;
-            addresses = findAllAddressesForSignature(signature);
+            addresses = findAllAddressesForSignature(signature, true);
 
             if (addresses.isEmpty()) {
                 println("Signature not found");
@@ -341,7 +341,7 @@ public class Sigga extends GhidraScript {
      * @return A list of addresses matching the signature
      * @throws InvalidParameterException
      */
-    private List<Address> findAllAddressesForSignature(String signature) throws InvalidParameterException {
+    private List<Address> findAllAddressesForSignature(String signature, boolean useMonitor) throws InvalidParameterException {
         // See class definition
         ByteSignature byteSignature = new ByteSignature(signature);
 
@@ -350,7 +350,7 @@ public class Sigga extends GhidraScript {
         byte[] mask = byteSignature.getMask();
 
         List<Address> addresses = findAllBytesManual(currentProgram.getMinAddress(), currentProgram.getMaxAddress(),
-                bytes, mask);
+                bytes, mask, useMonitor);
 
         return addresses;
     }
@@ -440,30 +440,61 @@ public class Sigga extends GhidraScript {
      * @param mask The mask to use for the search where 0 = wildcard, 1 = match
      * @return A list of addresses matching the pattern
      */
-    private List<Address> findAllBytesManual(Address start, Address end, byte[] pattern, byte[] mask) {
+    private List<Address> findAllBytesManual(Address start, Address end, byte[] pattern, byte[] mask, boolean useMonitor) {
         Memory memory = currentProgram.getMemory();
         Anchor anchor = extractAnchor(pattern, mask);
 
         List<Address> results = new ArrayList<>();
 
         if (anchor == null) {
-            println("No anchor found in pattern.");
+            if (useMonitor) println("No anchor found in pattern.");
             return results;
         }
 
+        long totalRange = 0;
+        for (MemoryBlock block : memory.getBlocks()) {
+            if (block.getStart().compareTo(end) > 0 || block.getEnd().compareTo(start) < 0) {
+                continue;
+            }
+            Address blockStart = block.getStart().compareTo(start) < 0 ? start : block.getStart();
+            Address blockEnd = block.getEnd().compareTo(end) > 0 ? end : block.getEnd();
+            totalRange += blockEnd.subtract(blockStart) + 1;
+        }
+
+        if (totalRange <= 0) {
+            if (useMonitor) println("No mapped memory found in range.");
+            return results;
+        }
+
+        if (useMonitor) monitor.initialize(totalRange);
+
         Address cur = start;
-        long totalRange = end.subtract(start);
-        monitor.initialize(totalRange);
+        Address prevCur = start;
+        long searchedBytes = 0;
 
         while (cur.compareTo(end) <= 0) {
-            if (monitor.isCancelled()) {
-                println("Search cancelled.");
+            if (useMonitor && monitor.isCancelled()) {
+                if (useMonitor) println("Search cancelled.");
                 return results;
             }
 
+            if (memory.getBlock(cur) == null) {
+                Address nextMapped = null;
+                for (MemoryBlock b : memory.getBlocks()) {
+                    if (b.getStart().compareTo(cur) > 0 && b.getStart().compareTo(end) <= 0) {
+                        nextMapped = b.getStart();
+                        break;
+                    }
+                }
+                if (nextMapped == null) break;
+
+                prevCur = cur;
+                cur = nextMapped;
+                continue;
+            }
+
             try {
-                Address anchorAddr = memory.findBytes(
-                    cur, end, anchor.anchorBytes, null, true, monitor);
+                Address anchorAddr = memory.findBytes(cur, end, anchor.anchorBytes, null, true, useMonitor ? monitor : null);
 
                 if (anchorAddr == null) {
                     break;
@@ -471,10 +502,12 @@ public class Sigga extends GhidraScript {
 
                 Address potentialStart = anchorAddr.subtract(anchor.offsetInPattern);
 
-                // Check if the full pattern fits in memory range
-                if (potentialStart.compareTo(start) < 0 || 
+                if (potentialStart.compareTo(start) < 0 ||
                     potentialStart.add(pattern.length).compareTo(end) > 0) {
+                    prevCur = cur;
                     cur = anchorAddr.add(1);
+                    if (useMonitor)
+                        searchedBytes = updateProgress(prevCur, cur, start, totalRange, searchedBytes);
                     continue;
                 }
 
@@ -493,15 +526,42 @@ public class Sigga extends GhidraScript {
                     results.add(potentialStart);
                 }
 
-                // Move past the current anchor to keep searching
+                prevCur = cur;
                 cur = anchorAddr.add(1);
             } catch (Exception e) {
-                cur = cur.add(1); // On failure, advance to the next byte
+                prevCur = cur;
+                cur = cur.add(1);
             }
 
-            monitor.incrementProgress(1);
+            if (useMonitor)
+                searchedBytes = updateProgress(prevCur, cur, start, totalRange, searchedBytes);
+        }
+
+        if (useMonitor) {
+            monitor.setProgress(totalRange);
         }
 
         return results;
+    }
+
+    private long updateProgress(Address prevCur, Address cur, Address start, long totalRange, long searchedBytes) {
+        Memory memory = currentProgram.getMemory();
+
+        long moved = 0;
+        Address a = prevCur;
+        while (a.compareTo(cur) < 0 && searchedBytes + moved < totalRange) {
+            if (memory.getBlock(a) != null) {
+                moved++;
+            }
+            a = a.add(1);
+        }
+
+        searchedBytes += moved;
+        if (searchedBytes > totalRange) searchedBytes = totalRange;
+
+        monitor.setProgress(searchedBytes);
+        double percent = (searchedBytes * 100.0) / totalRange;
+
+        return searchedBytes;
     }
 }
