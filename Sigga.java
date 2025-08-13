@@ -1,7 +1,7 @@
 // A massively improved sigmaker for Ghidra
 // This version includes a fast "Sliding Window" algorithm and a powerful "XRef Fallback"
 // to create reliable signatures for even the most complex, non-unique functions.
-//@author lexika, Krixx1337
+//@author lexika, Krixx1337, outercloudstudio
 //@category Functions
 //@keybinding
 //@menupath
