@@ -9,23 +9,29 @@
 
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
+import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
 import ghidra.program.model.mem.Memory;
 import ghidra.program.model.mem.MemoryAccessException;
 import ghidra.program.model.mem.MemoryBlock;
+import ghidra.program.model.reloc.Relocation;
+import ghidra.program.model.reloc.RelocationTable;
+import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.Reference;
-import ghidra.program.model.lang.Register;
 import ghidra.util.exception.CancelledException;
 
 import java.awt.Toolkit;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
-import java.util.Arrays;
 
 public class Sigga extends GhidraScript {
 
@@ -108,7 +114,7 @@ public class Sigga extends GhidraScript {
             findSignature();
         }
     }
-    
+
     /**
      * Main function to create a signature for the function at the current cursor location.
      * Uses a two-phase approach: direct scan, then XRef fallback scan.
@@ -121,35 +127,54 @@ public class Sigga extends GhidraScript {
         }
 
         println("Phase 1: Scanning for a direct signature in: " + function.getName());
-        
-        List<String> featureVector = buildFeatureVector(function, MAX_INSTRUCTIONS_TO_SCAN);
-        if (featureVector.size() < MIN_WINDOW_BYTES) {
-            println("Function is too small for direct scan, proceeding to XRef scan.");
-        } else {
-            // Use a sliding window to find the first unique pattern within the function.
-            for (int windowSize = MIN_WINDOW_BYTES; windowSize <= MAX_WINDOW_BYTES; windowSize += WINDOW_STEP_BYTES) {
-                monitor.checkCancelled();
-                monitor.setMessage(String.format("Sigga: Searching with window size %d...", windowSize));
-                for (int offset = 0; offset <= featureVector.size() - windowSize; offset++) {
-                    monitor.checkCancelled();
-                    List<String> window = featureVector.subList(offset, offset + windowSize);
-                    String signature = String.join(" ", window);
-                    if (isSignatureUniqueInBinary(signature)) {
-                        String finalOutput = String.format("Signature: \"%s\" (Offset: %d)", signature, offset);
-                        copyToClipboard(signature);
-                        println("Found unique direct signature!");
-                        println(finalOutput + " - Signature text copied to clipboard.");
-                        return;
-                    }
-                }
+
+        List<List<String>> windows = buildInstructionWindows(function, MAX_INSTRUCTIONS_TO_SCAN, MIN_WINDOW_BYTES, MAX_WINDOW_BYTES);
+        for (List<String> w : windows) {
+            monitor.checkCancelled();
+            if (!goodHead(w)) continue;                   // skip windows that start with "?" or are too weak up front
+            String sig = String.join(" ", w);
+            if (isSignatureUniqueInBinary(sig)) {
+                copyToClipboard(sig);
+                println("Found unique direct signature!");
+                println("Signature: \"" + sig + "\"");
+                return;
             }
         }
-        
-        // If Phase 1 fails, attempt to find a signature via a cross-reference.
+
         println("Phase 1 failed. Proceeding to Phase 2: Signature by Cross-Reference (XRef).");
         tryXRefSignature(function);
     }
-    
+
+    private List<List<String>> buildInstructionWindows(Function f, int maxInsns, int minBytes, int maxBytes) throws MemoryAccessException {
+        List<List<String>> perInsn = new LinkedList<>();
+        InstructionIterator it = currentProgram.getListing().getInstructions(f.getBody(), true);
+        while (it.hasNext() && perInsn.size() < maxInsns) {
+            perInsn.add(instructionToTokens(it.next()));
+        }
+        List<List<String>> windows = new LinkedList<>();
+        for (int i = 0; i < perInsn.size(); i++) {
+            List<String> acc = new LinkedList<>();
+            int total = 0;
+            for (int j = i; j < perInsn.size(); j++) {
+                List<String> add = perInsn.get(j);
+                if (total + add.size() > maxBytes) break;
+                acc.addAll(add);
+                total += add.size();
+                if (total >= minBytes) windows.add(new LinkedList<>(acc));
+            }
+        }
+        return windows;
+    }
+
+    private boolean goodHead(List<String> w) {
+        if (w == null || w.size() < 4) return false;
+        // require first 4 tokens to be solid bytes
+        for (int i = 0; i < 4; i++) {
+            if ("?".equals(w.get(i))) return false;
+        }
+        return true;
+    }
+
     /**
      * Fallback method to find a signature for a function's CALLER.
      *
@@ -218,18 +243,81 @@ public class Sigga extends GhidraScript {
     /**
      * Converts a single instruction into a list of byte tokens.
      */
-    private List<String> instructionToTokens(Instruction instruction) throws MemoryAccessException {
-        List<String> tokens = new LinkedList<>();
-        if (isInstructionStableForSignature(instruction)) {
-            for (byte b : instruction.getBytes()) {
-                tokens.add(String.format("%02X", b));
-            }
-        } else {
-            for (int i = 0; i < instruction.getLength(); i++) {
-                tokens.add("?");
+    private List<String> instructionToTokens(Instruction insn) throws MemoryAccessException {
+        byte[] bytes = insn.getBytes();
+        String[] tok = new String[bytes.length];
+        for (int i = 0; i < bytes.length; i++) tok[i] = String.format("%02X", bytes[i]);
+
+        // 1) calls, jumps, returns, mask fully
+        if (insn.getFlowType().isCall() || insn.getFlowType().isJump() || insn.getFlowType().isTerminal()) {
+            Arrays.fill(tok, "?");
+            return Arrays.asList(tok);
+        }
+
+        // 2) mask bytes covered by relocations in this instruction
+        RelocationTable rt = currentProgram.getRelocationTable();
+        Address insnStart = insn.getAddress();
+        Address insnEnd = insnStart.add(bytes.length - 1);
+        Iterator<Relocation> it = rt.getRelocations(new AddressSet(insnStart, insnEnd));
+        while (it.hasNext()) {
+            Relocation rel = it.next();
+            Address ra = rel.getAddress();
+            int off = (int) ra.subtract(insnStart);
+            int len;
+            try { len = rel.getLength(); } catch (Throwable t) { len = 4; }
+            if (len <= 0) len = Math.min(4, Math.max(0, tok.length - off));
+            for (int i = 0; i < len && off + i < tok.length && off + i >= 0; i++) tok[off + i] = "?";
+        }
+
+        // 3) mask trailing immediate scalars
+        for (int op = 0; op < insn.getNumOperands(); op++) {
+            if ((insn.getOperandType(op) & ghidra.program.model.lang.OperandType.SCALAR) != 0) {
+                for (Object o : insn.getOpObjects(op)) {
+                    if (o instanceof Scalar) {
+                        int bits = ((Scalar) o).bitLength();
+                        int n = Math.max(1, (bits + 7) / 8);
+                        for (int i = 0; i < n && i < tok.length; i++) tok[tok.length - 1 - i] = "?";
+                    }
+                }
             }
         }
-        return tokens;
+
+        // 4) mask RIP or EIP relative disp32 on memory refs
+        boolean ripOrEipSeen = false, hasMemRef = false;
+        for (int op = 0; op < insn.getNumOperands(); op++) {
+            for (Object o : insn.getOpObjects(op)) {
+                if (o instanceof Register) {
+                    String rn = ((Register) o).getName().toUpperCase();
+                    if (rn.equals("RIP") || rn.equals("EIP")) ripOrEipSeen = true;
+                }
+            }
+            if (insn.getOperandReferences(op).length > 0) hasMemRef = true;
+        }
+        if (ripOrEipSeen && hasMemRef && tok.length >= 4) {
+            for (int i = 0; i < 4; i++) tok[tok.length - 1 - i] = "?";
+        }
+
+        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], unconditionally
+        for (int op = 0; op < insn.getNumOperands(); op++) {
+            Object[] objs = insn.getOpObjects(op);
+            boolean baseIsSpBp = false;
+            for (Object o : objs) {
+                if (o instanceof Register) {
+                    String rn = ((Register) o).getName().toUpperCase();
+                    if (rn.equals("RSP") || rn.equals("ESP") || rn.equals("RBP") || rn.equals("EBP")) {
+                        baseIsSpBp = true;
+                    }
+                }
+            }
+            if (baseIsSpBp) {
+                // Mask up to 4 trailing bytes in the encoding to cover disp8 or disp32
+                int n = Math.min(4, tok.length);
+                for (int i = 0; i < n; i++) tok[tok.length - 1 - i] = "?";
+                break; // one mem operand is enough
+            }
+        }
+
+        return Arrays.asList(tok);
     }
 
     /**
