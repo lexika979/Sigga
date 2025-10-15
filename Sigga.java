@@ -40,6 +40,8 @@ public class Sigga extends GhidraScript {
     private static final int MIN_WINDOW_BYTES = 16;
     private static final int MAX_WINDOW_BYTES = 64;
     private static final int XREF_SIG_INSTRUCTIONS = 8; // How many instructions to use for an XRef signature.
+    private static final int HEAD_CHECK_SPAN = 6;   // how many tokens to inspect from the start
+    private static final int HEAD_MIN_SOLID  = 6;   // require at least this many non "?" in that span
 
     /**
      * Helper class to convert a string signature to bytes + mask.
@@ -175,11 +177,13 @@ public class Sigga extends GhidraScript {
     }
 
     private boolean goodHead(List<String> w) {
-        if (w == null || w.size() < 6) return false;
-        for (int i = 0; i < 6; i++) {
-            if ("?".equals(w.get(i))) return false;
+        if (w == null || w.isEmpty()) return false;
+        int span = Math.min(HEAD_CHECK_SPAN, w.size());
+        int solid = 0;
+        for (int i = 0; i < span; i++) {
+            if (!"?".equals(w.get(i))) solid++;
         }
-        return true;
+        return solid >= HEAD_MIN_SOLID;
     }
 
     /**
