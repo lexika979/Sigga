@@ -39,7 +39,6 @@ public class Sigga extends GhidraScript {
     private static final int MAX_INSTRUCTIONS_TO_SCAN = 256;
     private static final int MIN_WINDOW_BYTES = 16;
     private static final int MAX_WINDOW_BYTES = 64;
-    private static final int WINDOW_STEP_BYTES = 8;
     private static final int XREF_SIG_INSTRUCTIONS = 8; // How many instructions to use for an XRef signature.
 
     /**
@@ -120,9 +119,18 @@ public class Sigga extends GhidraScript {
      * Uses a two-phase approach: direct scan, then XRef fallback scan.
      */
     private void createSignature() throws MemoryAccessException, CancelledException {
+        if (currentLocation == null) {
+            printerr("No current location.");
+            return;
+        }
         Function function = getFunctionContaining(currentLocation.getAddress());
         if (function == null) {
             printerr("No function selected.");
+            return;
+        }
+        if (function.isThunk()) { // skip import thunks and stubs
+            println("Selected function is a thunk, trying XRef fallback.");
+            tryXRefSignature(function);
             return;
         }
 
@@ -191,9 +199,9 @@ public class Sigga extends GhidraScript {
                 continue;
             }
 
-            // Create a signature from the instructions leading up to the CALL.
+            // Create a signature from the instructions leading up to the CALL, exclude the CALL itself
             List<Instruction> xrefInstructions = new LinkedList<>();
-            Instruction current = refInstr;
+            Instruction current = refInstr.getPrevious(); // start before the CALL
             for (int i = 0; i < XREF_SIG_INSTRUCTIONS && current != null; i++) {
                 xrefInstructions.add(current);
                 current = current.getPrevious();
@@ -210,22 +218,6 @@ public class Sigga extends GhidraScript {
             }
         }
         printerr("Failed to find any unique signature for this function, even via XRefs.");
-    }
-    
-    /**
-     * Converts a large chunk of a function into a "feature vector" of byte tokens.
-     *
-     * @param function The function to analyze.
-     * @param limit The maximum number of instructions to process.
-     * @return A list of strings, where each string is a hex byte ("XX") or a wildcard ("?").
-     */
-    private List<String> buildFeatureVector(Function function, int limit) throws MemoryAccessException {
-        List<String> tokens = new LinkedList<>();
-        InstructionIterator iter = currentProgram.getListing().getInstructions(function.getBody(), true);
-        while (iter.hasNext() && tokens.size() < (limit * 16)) { // Heuristic limit
-            tokens.addAll(instructionToTokens(iter.next()));
-        }
-        return tokens;
     }
     
     /**
@@ -247,8 +239,55 @@ public class Sigga extends GhidraScript {
         String[] tok = new String[bytes.length];
         for (int i = 0; i < bytes.length; i++) tok[i] = String.format("%02X", bytes[i]);
 
-        // 1) calls, jumps, returns, mask fully
-        if (insn.getFlowType().isCall() || insn.getFlowType().isJump() || insn.getFlowType().isTerminal()) {
+        // 1) control flow, keep opcode, mask only relative offsets when applicable
+        if (insn.getFlowType().isCall()) {
+            // near rel32: E8 xx xx xx xx
+            if (bytes.length == 5 && (bytes[0] & 0xFF) == 0xE8) {
+                for (int i = 1; i < 5; i++) tok[i] = "?";
+                return Arrays.asList(tok);
+            }
+            // other calls, often indirect, remain volatile
+            Arrays.fill(tok, "?");
+            return Arrays.asList(tok);
+        }
+        // x86 loop family and jecxz, keep opcode and mask rel8
+        if (bytes.length == 2) {
+            int b0 = bytes[0] & 0xFF;
+            if (b0 == 0xE0 || b0 == 0xE1 || b0 == 0xE2 || b0 == 0xE3) { // LOOPNE, LOOPE, LOOP, JECXZ
+                tok[1] = "?";
+                return Arrays.asList(tok);
+            }
+        }
+        if (insn.getFlowType().isJump()) {
+            // short jmp: EB rel8
+            if (bytes.length == 2 && (bytes[0] & 0xFF) == 0xEB) {
+                tok[1] = "?";
+                return Arrays.asList(tok);
+            }
+            // near jmp: E9 rel32
+            if (bytes.length == 5 && (bytes[0] & 0xFF) == 0xE9) {
+                for (int i = 1; i < 5; i++) tok[i] = "?";
+                return Arrays.asList(tok);
+            }
+            Arrays.fill(tok, "?");
+            return Arrays.asList(tok);
+        }
+        if (insn.getFlowType().isConditional()) {
+            // short Jcc: 7x rel8
+            if (bytes.length == 2 && (bytes[0] & 0xF0) == 0x70) {
+                tok[1] = "?";
+                return Arrays.asList(tok);
+            }
+            // near Jcc: 0F 8x rel32
+            if (bytes.length >= 6 && (bytes[0] & 0xFF) == 0x0F && (bytes[1] & 0xF0) == 0x80) {
+                for (int i = bytes.length - 4; i < bytes.length; i++) tok[i] = "?";
+                return Arrays.asList(tok);
+            }
+            Arrays.fill(tok, "?");
+            return Arrays.asList(tok);
+        }
+        // returns remain fully masked
+        if (insn.getFlowType().isTerminal()) {
             Arrays.fill(tok, "?");
             return Arrays.asList(tok);
         }
@@ -353,52 +392,37 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Determines if an instruction is "stable" enough to be included in a signature.
-     * Unstable instructions (jumps, calls, stack operations) are wildcarded.
-     * This version is compatible with both x86 and x64 architectures.
-     *
-     * @param instruction The instruction to check.
-     * @return True if the instruction is stable.
-     */
-    private boolean isInstructionStableForSignature(Instruction instruction) {
-        if (instruction.getFlowType().isJump() || instruction.getFlowType().isCall()) {
-            return false;
-        }
-
-        for (int i = 0; i < instruction.getNumOperands(); i++) {
-            Object[] opObjects = instruction.getOpObjects(i);
-            for (Object obj : opObjects) {
-                if (obj instanceof Register) {
-                    Register reg = (Register) obj;
-                    String regName = reg.getName().toUpperCase();
-                    // Check for all common stack and base pointer register names for x86/x64.
-                    if (regName.equals("RSP") || regName.equals("ESP") ||  // Stack Pointers
-                        regName.equals("RBP") || regName.equals("EBP")) {  // Base Pointers
-                        return false;
-                    }
-                }
-            }
-        }
-        
-        return true;
-    }
-
-    /**
      * Scans the entire program memory to check if a signature is unique.
      *
      * @param signature The signature to test.
      * @return True if exactly one match is found.
      */
     private boolean isSignatureUniqueInBinary(String signature) throws CancelledException {
-        if (signature.isEmpty()) return false;
+        if (signature == null || signature.isEmpty()) return false;
         ByteSignature sig = new ByteSignature(signature);
         Memory mem = currentProgram.getMemory();
-        Address firstMatch = mem.findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
-        if (firstMatch == null) return false;
-        Address secondMatch = mem.findBytes(firstMatch.add(1), sig.bytes, sig.mask, true, monitor);
-        return (secondMatch == null);
+        int hits = 0;
+
+        for (MemoryBlock block : mem.getBlocks()) {
+            if (!block.isExecute()) continue;
+            Address start = block.getStart();
+            Address end = block.getEnd();
+            Address cur = start;
+
+            while (true) {
+                monitor.checkCancelled();
+                Address hit = mem.findBytes(cur, sig.getBytes(), sig.getMask(), true, monitor);
+                if (hit == null || hit.compareTo(end) > 0) break;
+                hits++;
+                if (hits > 1) return false;
+                Address next = hit.add(1);
+                if (next.compareTo(end) > 0) break;
+                cur = next;
+            }
+        }
+        return hits == 1;
     }
-    
+
     /**
      * Prompts the user for a signature and finds its location in memory.
      */
@@ -406,13 +430,27 @@ public class Sigga extends GhidraScript {
         try {
             String signature = askString("Find Signature", "Enter signature:");
             ByteSignature sig = new ByteSignature(signature);
-            Address found = currentProgram.getMemory().findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
-            if (found == null) {
-                println("Signature not found.");
-            } else { 
-                println("Signature found at: " + found);
-                goTo(found);
+
+            Memory mem = currentProgram.getMemory();
+            for (MemoryBlock block : mem.getBlocks()) {
+                if (!block.isExecute()) continue;
+
+                Address start = block.getStart();
+                Address end = block.getEnd();
+                Address cur = start;
+
+                while (true) {
+                    monitor.checkCancelled();
+                    Address hit = mem.findBytes(cur, sig.getBytes(), sig.getMask(), true, monitor);
+                    if (hit == null || hit.compareTo(end) > 0) break;
+
+                    println("Signature found at: " + hit);
+                    goTo(hit);
+                    return; // stop at first executable match
+                }
             }
+
+            println("Signature not found in executable blocks.");
         } catch (Exception e) {
             printerr("Error: " + e.getMessage());
         }
