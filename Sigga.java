@@ -167,9 +167,8 @@ public class Sigga extends GhidraScript {
     }
 
     private boolean goodHead(List<String> w) {
-        if (w == null || w.size() < 4) return false;
-        // require first 4 tokens to be solid bytes
-        for (int i = 0; i < 4; i++) {
+        if (w == null || w.size() < 6) return false;
+        for (int i = 0; i < 6; i++) {
             if ("?".equals(w.get(i))) return false;
         }
         return true;
@@ -297,12 +296,13 @@ public class Sigga extends GhidraScript {
             for (int i = 0; i < 4; i++) tok[tok.length - 1 - i] = "?";
         }
 
-        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], but only when it's a MEM operand
+        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], mask only the disp bytes
         for (int op = 0; op < insn.getNumOperands(); op++) {
             Object[] objs = insn.getOpObjects(op);
 
             boolean hasSpBp = false;
-            boolean hasDispScalar = false;
+            int dispBytes = 0;        // 0 means no displacement detected
+            boolean memOperand = false;
 
             for (Object o : objs) {
                 if (o instanceof Register) {
@@ -311,16 +311,41 @@ public class Sigga extends GhidraScript {
                         hasSpBp = true;
                     }
                 } else if (o instanceof Scalar) {
-                    // displacement in SIB addressing is modeled as a Scalar
-                    hasDispScalar = true;
+                    int bits = ((Scalar) o).bitLength();
+                    if (bits <= 8) dispBytes = Math.max(dispBytes, 1);
+                    else if (bits <= 32) dispBytes = Math.max(dispBytes, 4);
                 }
             }
 
-            // Only mask when the same operand looks like [sp/bp + disp]
-            if (hasSpBp && hasDispScalar) {
-                int n = Math.min(4, tok.length); // cover disp8 or disp32
-                for (int i = 0; i < n; i++) tok[tok.length - 1 - i] = "?";
-                break; // one such operand is enough
+            // treat as memory if operand has refs, or is typed as ADDRESS
+            int optype = insn.getOperandType(op);
+            if (insn.getOperandReferences(op).length > 0 || (optype & OperandType.ADDRESS) != 0) {
+                memOperand = true;
+            }
+
+            if (hasSpBp && memOperand) {
+                if (dispBytes == 0) dispBytes = 1;  // typical [rsp+imm8] uses an 8-bit disp, keep opcode/ModRM/SIB
+                for (int i = 0; i < dispBytes && i < tok.length; i++) {
+                    tok[tok.length - 1 - i] = "?";  // mask only trailing disp bytes
+                }
+            }
+        }
+
+        // 6) extra safety for LEA, mask only the displacement at the end of the encoding
+        if ("LEA".equalsIgnoreCase(insn.getMnemonicString())) {
+            int dispBytes = 0;
+            for (int op = 0; op < insn.getNumOperands(); op++) {
+                for (Object o : insn.getOpObjects(op)) {
+                    if (o instanceof Scalar) {
+                        int bits = ((Scalar) o).bitLength();
+                        if (bits <= 8) dispBytes = Math.max(dispBytes, 1);
+                        else if (bits <= 32) dispBytes = Math.max(dispBytes, 4);
+                    }
+                }
+            }
+            if (dispBytes == 0) dispBytes = 1; // common LEA [rsp+imm8]
+            for (int i = 0; i < dispBytes && i < tok.length; i++) {
+                tok[tok.length - 1 - i] = "?"; // mask only trailing disp bytes
             }
         }
 
