@@ -297,23 +297,30 @@ public class Sigga extends GhidraScript {
             for (int i = 0; i < 4; i++) tok[tok.length - 1 - i] = "?";
         }
 
-        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], unconditionally
+        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], but only when it's a MEM operand
         for (int op = 0; op < insn.getNumOperands(); op++) {
             Object[] objs = insn.getOpObjects(op);
-            boolean baseIsSpBp = false;
+
+            boolean hasSpBp = false;
+            boolean hasDispScalar = false;
+
             for (Object o : objs) {
                 if (o instanceof Register) {
                     String rn = ((Register) o).getName().toUpperCase();
                     if (rn.equals("RSP") || rn.equals("ESP") || rn.equals("RBP") || rn.equals("EBP")) {
-                        baseIsSpBp = true;
+                        hasSpBp = true;
                     }
+                } else if (o instanceof Scalar) {
+                    // displacement in SIB addressing is modeled as a Scalar
+                    hasDispScalar = true;
                 }
             }
-            if (baseIsSpBp) {
-                // Mask up to 4 trailing bytes in the encoding to cover disp8 or disp32
-                int n = Math.min(4, tok.length);
+
+            // Only mask when the same operand looks like [sp/bp + disp]
+            if (hasSpBp && hasDispScalar) {
+                int n = Math.min(4, tok.length); // cover disp8 or disp32
                 for (int i = 0; i < n; i++) tok[tok.length - 1 - i] = "?";
-                break; // one mem operand is enough
+                break; // one such operand is enough
             }
         }
 
