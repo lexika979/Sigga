@@ -435,9 +435,9 @@ public class Sigga extends GhidraScript {
                 tok[1] = "?";
                 return Arrays.asList(tok);
             }
-            // near Jcc: 0F 8x rel32
-            if (bytes.length >= 6 && (bytes[0] & 0xFF) == 0x0F && (bytes[1] & 0xF0) == 0x80) {
-                for (int i = bytes.length - 4; i < bytes.length; i++) tok[i] = "?";
+            // near Jcc: 0F 8x rel32 (standard encoding is exactly 6 bytes: 0F 8x + 4-byte offset)
+            if (bytes.length == 6 && (bytes[0] & 0xFF) == 0x0F && (bytes[1] & 0xF0) == 0x80) {
+                for (int i = 2; i < 6; i++) tok[i] = "?";
                 return Arrays.asList(tok);
             }
             Arrays.fill(tok, "?");
@@ -454,14 +454,20 @@ public class Sigga extends GhidraScript {
         Address insnStart = insn.getAddress();
         Address insnEnd = insnStart.add(bytes.length - 1);
         Iterator<Relocation> it = rt.getRelocations(new AddressSet(insnStart, insnEnd));
+        int defaultPointerSize = currentProgram.getDefaultPointerSize();
         while (it.hasNext()) {
             Relocation rel = it.next();
             Address ra = rel.getAddress();
             int off = (int) ra.subtract(insnStart);
             int len;
-            try { len = rel.getLength(); } catch (Throwable t) { len = 4; }
-            if (len <= 0) len = Math.min(4, Math.max(0, tok.length - off));
-            for (int i = 0; i < len && off + i < tok.length && off + i >= 0; i++) tok[off + i] = "?";
+            try {
+                len = rel.getLength();
+            } catch (Throwable t) {
+                printerr("Failed to get relocation length at " + ra + ": " + t);
+                len = defaultPointerSize;
+            }
+            if (len <= 0) len = Math.min(defaultPointerSize, Math.max(0, tok.length - off));
+            for (int i = 0; i < len && off + i < tok.length; i++) tok[off + i] = "?";
         }
 
         // 3) mask trailing immediate scalars
