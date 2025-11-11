@@ -104,6 +104,22 @@ public class Sigga extends GhidraScript {
     }
 
     /**
+     * Helper class to store a window with its starting instruction address.
+     */
+    private static class WindowWithOffset {
+        private List<String> window;
+        private Address startAddress;
+
+        public WindowWithOffset(List<String> window, Address startAddress) {
+            this.window = window;
+            this.startAddress = startAddress;
+        }
+
+        public List<String> getWindow() { return window; }
+        public Address getStartAddress() { return startAddress; }
+    }
+
+    /**
      * The script entry point.
      */
     @Override
@@ -138,15 +154,19 @@ public class Sigga extends GhidraScript {
 
         println("Phase 1: Scanning for a direct signature in: " + function.getName());
 
-        List<List<String>> windows = buildInstructionWindows(function, MAX_INSTRUCTIONS_TO_SCAN, MIN_WINDOW_BYTES, MAX_WINDOW_BYTES);
-        for (List<String> w : windows) {
+        List<WindowWithOffset> windows = buildInstructionWindows(function, MAX_INSTRUCTIONS_TO_SCAN, MIN_WINDOW_BYTES, MAX_WINDOW_BYTES);
+        Address functionStart = function.getEntryPoint();
+        for (WindowWithOffset windowWithOffset : windows) {
             monitor.checkCancelled();
+            List<String> w = windowWithOffset.getWindow();
             if (!goodHead(w)) continue;                   // skip windows that start with "?" or are too weak up front
             String sig = String.join(" ", w);
             if (isSignatureUniqueInBinary(sig)) {
+                long offset = windowWithOffset.getStartAddress().subtract(functionStart);
+                String finalOutput = String.format("Signature: \"%s\" (Offset: %d)", sig, offset);
                 copyToClipboard(sig);
                 println("Found unique direct signature!");
-                println("Signature: \"" + sig + "\"");
+                println(finalOutput + " - Signature text copied to clipboard.");
                 return;
             }
         }
@@ -155,22 +175,26 @@ public class Sigga extends GhidraScript {
         tryXRefSignature(function);
     }
 
-    private List<List<String>> buildInstructionWindows(Function f, int maxInsns, int minBytes, int maxBytes) throws MemoryAccessException {
+    private List<WindowWithOffset> buildInstructionWindows(Function f, int maxInsns, int minBytes, int maxBytes) throws MemoryAccessException {
         List<List<String>> perInsn = new LinkedList<>();
+        List<Address> insnAddresses = new LinkedList<>();
         InstructionIterator it = currentProgram.getListing().getInstructions(f.getBody(), true);
         while (it.hasNext() && perInsn.size() < maxInsns) {
-            perInsn.add(instructionToTokens(it.next()));
+            Instruction insn = it.next();
+            perInsn.add(instructionToTokens(insn));
+            insnAddresses.add(insn.getAddress());
         }
-        List<List<String>> windows = new LinkedList<>();
+        List<WindowWithOffset> windows = new LinkedList<>();
         for (int i = 0; i < perInsn.size(); i++) {
             List<String> acc = new LinkedList<>();
             int total = 0;
+            Address startAddr = insnAddresses.get(i);
             for (int j = i; j < perInsn.size(); j++) {
                 List<String> add = perInsn.get(j);
                 if (total + add.size() > maxBytes) break;
                 acc.addAll(add);
                 total += add.size();
-                if (total >= minBytes) windows.add(new LinkedList<>(acc));
+                if (total >= minBytes) windows.add(new WindowWithOffset(new LinkedList<>(acc), startAddr));
             }
         }
         return windows;
@@ -203,21 +227,20 @@ public class Sigga extends GhidraScript {
                 continue;
             }
 
-            // Create a signature from the instructions leading up to the CALL, exclude the CALL itself
+            // Create a signature starting from the CALL instruction itself, then include instructions after it
             List<Instruction> xrefInstructions = new LinkedList<>();
-            Instruction current = refInstr.getPrevious(); // start before the CALL
+            Instruction current = refInstr; // start at the CALL
             for (int i = 0; i < XREF_SIG_INSTRUCTIONS && current != null; i++) {
                 xrefInstructions.add(current);
-                current = current.getPrevious();
+                current = current.getNext();
             }
-            Collections.reverse(xrefInstructions);
             
             String signature = buildFeatureString(xrefInstructions);
             if (isSignatureUniqueInBinary(signature)) {
                 String finalOutput = String.format("Signature: \"%s\" (Found via XRef from %s)", signature, refAddr);
                 copyToClipboard(signature);
                 println("Found unique XRef signature!");
-                println(finalOutput + " - This signature finds the CALLER, not the function itself.");
+                println(finalOutput + " - This signature points directly to the call site.");
                 return;
             }
         }
