@@ -120,6 +120,28 @@ public class Sigga extends GhidraScript {
     }
 
     /**
+     * Helper class to store scan results and debug information.
+     */
+    private static class ScanResult {
+        boolean success;
+        int totalWindows;
+        int windowsPassedHeadCheck;
+        int windowsTestedForUniqueness;
+        List<String> sampleRejectedWindows;
+        List<String> testedSignatures;
+
+        public ScanResult(boolean success, int totalWindows, int windowsPassedHeadCheck, 
+                         int windowsTestedForUniqueness, List<String> sampleRejectedWindows, List<String> testedSignatures) {
+            this.success = success;
+            this.totalWindows = totalWindows;
+            this.windowsPassedHeadCheck = windowsPassedHeadCheck;
+            this.windowsTestedForUniqueness = windowsTestedForUniqueness;
+            this.sampleRejectedWindows = sampleRejectedWindows;
+            this.testedSignatures = testedSignatures;
+        }
+    }
+
+    /**
      * The script entry point.
      */
     @Override
@@ -154,25 +176,129 @@ public class Sigga extends GhidraScript {
 
         println("Phase 1: Scanning for a direct signature in: " + function.getName());
 
+        ScanResult result = tryDirectSignatureWithStrictness(function, HEAD_MIN_SOLID);
+        if (result.success) {
+            return;
+        }
+
+        // Phase 1 failed - show interactive prompt
+        String choice = askChoice("Phase 1 Failed", 
+            "Direct signature scan failed. What would you like to do?",
+            Arrays.asList("Try with lower strictness", "Proceed to XRef fallback", "Show debug information"),
+            "Proceed to XRef fallback");
+
+        if ("Try with lower strictness".equals(choice)) {
+            println("Retrying with lower strictness (HEAD_MIN_SOLID: 4 instead of 6)...");
+            ScanResult retryResult = tryDirectSignatureWithStrictness(function, 4);
+            if (retryResult.success) {
+                return;
+            }
+            println("Retry with lower strictness also failed. Proceeding to XRef fallback.");
+            tryXRefSignature(function);
+        } else if ("Show debug information".equals(choice)) {
+            showDebugInformation(result);
+            String afterDebug = askChoice("Debug Info Shown", 
+                "What would you like to do now?",
+                Arrays.asList("Try with lower strictness", "Proceed to XRef fallback"),
+                "Proceed to XRef fallback");
+            if ("Try with lower strictness".equals(afterDebug)) {
+                println("Retrying with lower strictness (HEAD_MIN_SOLID: 4 instead of 6)...");
+                ScanResult retryResult = tryDirectSignatureWithStrictness(function, 4);
+                if (retryResult.success) {
+                    return;
+                }
+                println("Retry with lower strictness also failed. Proceeding to XRef fallback.");
+            }
+            tryXRefSignature(function);
+        } else {
+            println("Proceeding to Phase 2: Signature by Cross-Reference (XRef).");
+            tryXRefSignature(function);
+        }
+    }
+
+    /**
+     * Attempts to find a direct signature with configurable strictness.
+     *
+     * @param function The function to scan
+     * @param headMinSolid The minimum number of solid bytes required in the head check
+     * @return ScanResult containing success status and debug information
+     */
+    private ScanResult tryDirectSignatureWithStrictness(Function function, int headMinSolid) 
+            throws MemoryAccessException, CancelledException {
         List<WindowWithOffset> windows = buildInstructionWindows(function, MAX_INSTRUCTIONS_TO_SCAN, MIN_WINDOW_BYTES, MAX_WINDOW_BYTES);
         Address functionStart = function.getEntryPoint();
+        
+        int totalWindows = windows.size();
+        int windowsPassedHeadCheck = 0;
+        int windowsTestedForUniqueness = 0;
+        List<String> sampleRejectedWindows = new LinkedList<>();
+        List<String> testedSignatures = new LinkedList<>();
+        final int MAX_SAMPLE_WINDOWS = 5;
+        final int MAX_TESTED_SIGNATURES = 5;
+
         for (WindowWithOffset windowWithOffset : windows) {
             monitor.checkCancelled();
             List<String> w = windowWithOffset.getWindow();
-            if (!goodHead(w)) continue;                   // skip windows that start with "?" or are too weak up front
+            
+            if (!goodHead(w, headMinSolid)) {
+                if (sampleRejectedWindows.size() < MAX_SAMPLE_WINDOWS) {
+                    String sample = String.join(" ", w.subList(0, Math.min(20, w.size())));
+                    sampleRejectedWindows.add(sample + (w.size() > 20 ? "..." : ""));
+                }
+                continue;
+            }
+            
+            windowsPassedHeadCheck++;
             String sig = String.join(" ", w);
+            windowsTestedForUniqueness++;
+            
+            if (testedSignatures.size() < MAX_TESTED_SIGNATURES) {
+                String sigSample = sig.length() > 80 ? sig.substring(0, 80) + "..." : sig;
+                testedSignatures.add(sigSample);
+            }
+            
             if (isSignatureUniqueInBinary(sig)) {
                 long offset = windowWithOffset.getStartAddress().subtract(functionStart);
                 String finalOutput = String.format("Signature: \"%s\" (Offset: %d)", sig, offset);
                 copyToClipboard(sig);
                 println("Found unique direct signature!");
                 println(finalOutput + " - Signature text copied to clipboard.");
-                return;
+                return new ScanResult(true, totalWindows, windowsPassedHeadCheck, windowsTestedForUniqueness, null, null);
             }
         }
 
-        println("Phase 1 failed. Proceeding to Phase 2: Signature by Cross-Reference (XRef).");
-        tryXRefSignature(function);
+        return new ScanResult(false, totalWindows, windowsPassedHeadCheck, windowsTestedForUniqueness, sampleRejectedWindows, testedSignatures);
+    }
+
+    /**
+     * Displays debug information about why Phase 1 failed.
+     */
+    private void showDebugInformation(ScanResult result) {
+        println("=== Debug Information ===");
+        println("Total windows generated: " + result.totalWindows);
+        println("Windows passing head check (HEAD_MIN_SOLID=" + HEAD_MIN_SOLID + "): " + result.windowsPassedHeadCheck);
+        println("Windows tested for uniqueness: " + result.windowsTestedForUniqueness);
+        
+        if (result.windowsPassedHeadCheck == 0) {
+            println("\nReason: No windows passed the head check (too many wildcards at the start).");
+            println("All windows were rejected because they didn't have enough solid bytes in the first " + HEAD_CHECK_SPAN + " tokens.");
+            if (result.sampleRejectedWindows != null && !result.sampleRejectedWindows.isEmpty()) {
+                println("\nSample rejected windows (first " + result.sampleRejectedWindows.size() + "):");
+                for (String sample : result.sampleRejectedWindows) {
+                    println("  " + sample);
+                }
+            }
+        } else if (result.windowsTestedForUniqueness > 0) {
+            println("\nReason: All tested windows were not unique (found multiple matches in the binary).");
+            println("This function likely has very common patterns that appear in multiple places.");
+            if (result.testedSignatures != null && !result.testedSignatures.isEmpty()) {
+                println("\nSignatures that were tested (passed head check but failed uniqueness):");
+                for (String sig : result.testedSignatures) {
+                    println("  " + sig);
+                }
+            }
+        }
+        println("========================");
     }
 
     private List<WindowWithOffset> buildInstructionWindows(Function f, int maxInsns, int minBytes, int maxBytes) throws MemoryAccessException {
@@ -200,14 +326,18 @@ public class Sigga extends GhidraScript {
         return windows;
     }
 
-    private boolean goodHead(List<String> w) {
+    private boolean goodHead(List<String> w, int minSolid) {
         if (w == null || w.isEmpty()) return false;
         int span = Math.min(HEAD_CHECK_SPAN, w.size());
         int solid = 0;
         for (int i = 0; i < span; i++) {
             if (!"?".equals(w.get(i))) solid++;
         }
-        return solid >= HEAD_MIN_SOLID;
+        return solid >= minSolid;
+    }
+
+    private boolean goodHead(List<String> w) {
+        return goodHead(w, HEAD_MIN_SOLID);
     }
 
     /**
