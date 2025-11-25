@@ -35,9 +35,10 @@ public class Sigga extends GhidraScript {
     // --- CONFIGURATION ---
     private static final int MAX_INSTRUCTIONS_TO_SCAN = 300;
     private static final int MIN_WINDOW_BYTES = 5;    // Minimum length of a sig
-    private static final int MAX_WINDOW_BYTES = 150;  // Maximum length of a sig
+    private static final int MAX_WINDOW_BYTES = 120;  // Maximum length of a sig; capped to avoid endless scans
     private static final int HEAD_CHECK_SPAN = 3;     // First N bytes to check for stability
     private static final int XREF_CONTEXT_INSTRUCTIONS = 12; // How many instructions to grab for XRef sigs
+    private static final int MAX_START_OFFSET = 64;   // Only start sigs within first 64 bytes of function
 
     /**
      * Enum to control how aggressive the masking logic is.
@@ -55,12 +56,27 @@ public class Sigga extends GhidraScript {
         Address address;
         long offset; // Offset from start of function/block
         int quality; // 100 = Best, 0 = Worst
+        String tier;
 
-        public SigResult(String signature, Address address, long offset, int quality) {
+        public SigResult(String signature, Address address, long offset, int quality, String tier) {
             this.signature = signature;
             this.address = address;
             this.offset = offset;
             this.quality = quality;
+            this.tier = tier;
+        }
+    }
+
+    /**
+     * Data structure to map tokens back to instruction boundaries for optimization.
+     */
+    private static class TokenData {
+        List<String> tokens;
+        Set<Integer> instructionStartIndices; // Allows O(1) lookup
+
+        public TokenData(List<String> tokens, Set<Integer> starts) {
+            this.tokens = tokens;
+            this.instructionStartIndices = starts;
         }
     }
 
@@ -78,55 +94,51 @@ public class Sigga extends GhidraScript {
         }
 
         println("Sigga: Analyzing " + func.getName() + " @ " + func.getEntryPoint());
-        generateSignatureRoutine(func);
+        
+        try {
+            generateSignatureRoutine(func);
+        } catch (CancelledException e) {
+            println("Sigga: Generation cancelled by user.");
+        }
     }
 
-    // ============================================================================================
-    //  GENERATION LOGIC
-    // ============================================================================================
-
     private void generateSignatureRoutine(Function func) throws Exception {
-        // --- TIER 1 & 2: DIRECT SCAN ---
         List<Instruction> instructions = getInstructions(func.getBody(), MAX_INSTRUCTIONS_TO_SCAN);
-        List<String> strictTokens = tokenizeInstructions(instructions, MaskProfile.STRICT);
         
-        // Tier 1: Strict Masking + Solid Head (The "Perfect" Sig)
-        // Must start with a real byte (not ?), masks all offsets.
-        SigResult result = findCheapestSignature(strictTokens, func.getEntryPoint(), true);
-        if (result != null) {
-            finish(result, "Tier 1 (High Stability, Direct)");
+        // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
+        // We scan once with strict tokens. If we find a unique sig, we check its head.
+        // If head is solid -> Tier 1. If head is weak -> Tier 2.
+        monitor.setMessage("Scanning for Direct Signature...");
+        TokenData data = tokenizeInstructions(instructions, MaskProfile.STRICT);
+        // Tier 1: Strict masking with a solid head (first byte must be concrete, offsets masked).
+        // Tier 2: Same tokens but allows a weak head if uniqueness requires it.
+        SigResult directResult = findCheapestSignature(data, func.getEntryPoint());
+        
+        if (directResult != null) {
+            finish(directResult);
             return;
         }
         
-        println("... Tier 1 failed (No unique signature with strict masking & solid head).");
-
-        // Tier 2: Strict Masking + Loose Head
-        // Allows wildcards at the start if necessary.
-        result = findCheapestSignature(strictTokens, func.getEntryPoint(), false);
-        if (result != null) {
-            finish(result, "Tier 2 (High Stability, Loose Head)");
-            return;
-        }
-
-        println("... Tier 2 failed. Function is likely a duplicate or generic wrapper.");
+        println("... Direct scan failed. Function is likely generic/duplicate.");
 
         // --- TIER 3: XREF SCAN ---
-        // If the function itself is not unique (e.g., a thunk), scan the callers.
-        result = tryXRefSignature(func);
-        if (result != null) {
-            finish(result, "Tier 3 (XRef / Caller)");
+        monitor.setMessage("Checking Tier 3 (XRefs)...");
+        SigResult xrefResult = tryXRefSignature(func);
+        if (xrefResult != null) {
+            finish(xrefResult);
             return;
         }
 
         println("... Tier 3 failed (No unique XRefs found).");
 
         // --- TIER 4: DESPERATION ---
-        // Re-tokenize with minimal masking.
-        List<String> looseTokens = tokenizeInstructions(instructions, MaskProfile.MINIMAL);
-        result = findCheapestSignature(looseTokens, func.getEntryPoint(), false);
+        monitor.setMessage("Checking Tier 4 (Minimal)...");
+        TokenData looseData = tokenizeInstructions(instructions, MaskProfile.MINIMAL);
+        SigResult looseResult = findCheapestSignature(looseData, func.getEntryPoint());
         
-        if (result != null) {
-            finish(result, "Tier 4 (Low Stability / Desperation)");
+        if (looseResult != null) {
+            looseResult.tier = "Tier 4 (Low Stability / Desperation)";
+            finish(looseResult);
             return;
         }
 
@@ -135,9 +147,9 @@ public class Sigga extends GhidraScript {
               "and has no unique cross-references.");
     }
 
-    private void finish(SigResult result, String tierName) {
-        println("\n==================================================");
-        println(" SIGGA SUCCESS - " + tierName);
+    private void finish(SigResult result) {
+        println("==================================================");
+        println(" SIGGA SUCCESS - " + result.tier);
         println("==================================================");
         println("Signature:  " + result.signature);
         println("Address:    " + result.address);
@@ -150,22 +162,27 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * The Sliding Window Algorithm.
-     * Finds the shortest unique substring of tokens.
+     * Sliding Window Algorithm (optimized):
+     * Finds the shortest unique substring of tokens by:
+     * 1. Only starting at instruction boundaries (and near the head of the function).
+     * 2. Only checking uniqueness at instruction boundaries to cut redundant checks.
+     * 3. Classifying Tier 1 vs Tier 2 automatically by inspecting the head bytes.
      */
-    private SigResult findCheapestSignature(List<String> tokens, Address startAddr, boolean requireSolidHead) throws CancelledException {
+    private SigResult findCheapestSignature(TokenData data, Address startAddr) throws CancelledException {
+        List<String> tokens = data.tokens;
         int n = tokens.size();
 
-        // Iterate through all possible start positions (i)
+        // Iterate through possible start positions (i)
         for (int i = 0; i < n; i++) {
             monitor.checkCancelled();
+
+            // 1. Only start at instruction boundaries
+            if (!data.instructionStartIndices.contains(i)) continue;
+            // 2. Limit start depth (don't scan deep into massive functions)
+            if (i > MAX_START_OFFSET) break;
+
             StringBuilder sigBuilder = new StringBuilder();
             int byteCount = 0;
-
-            // Optimization: If requireSolidHead is true, skip windows starting with wildcard
-            if (requireSolidHead && isHeadWeak(tokens, i)) {
-                continue;
-            }
 
             // Grow the window (j)
             for (int j = i; j < n; j++) {
@@ -175,15 +192,26 @@ public class Sigga extends GhidraScript {
                 byteCount++;
 
                 if (byteCount < MIN_WINDOW_BYTES) continue;
-                if (byteCount > MAX_WINDOW_BYTES) break; // Window too big, move start index
+                if (byteCount > MAX_WINDOW_BYTES) break;
+
+                // 3. OPTIMIZATION: Only check uniqueness if we represent a full instruction.
+                // We assume we are at the end of an instruction if (j+1) is the start of a new one,
+                // or if we are at the very end of the list.
+                boolean isInstructionEnd = data.instructionStartIndices.contains(j + 1) || j == n - 1;
+                
+                if (!isInstructionEnd) {
+                    continue; 
+                }
 
                 // Check uniqueness
                 String currentSig = sigBuilder.toString();
                 if (isSignatureUnique(currentSig)) {
-                    // Offset calculation:
-                    // Since 'tokens' corresponds 1-to-1 with bytes in the function body,
-                    // the offset is simply the start index 'i'.
-                    return new SigResult(currentSig, startAddr, i, 100);
+                    // Found a unique sig. Classify it.
+                    boolean solidHead = !isHeadWeak(tokens, i);
+                    String tier = solidHead ? "Tier 1 (High Stability, Direct)" : "Tier 2 (High Stability, Loose Head)";
+                    int quality = solidHead ? 100 : 90;
+                    // Offset matches the sliding window start index because tokens map 1:1 with bytes.
+                    return new SigResult(currentSig, startAddr, i, quality, tier);
                 }
             }
         }
@@ -192,18 +220,17 @@ public class Sigga extends GhidraScript {
 
     private boolean isHeadWeak(List<String> tokens, int startIndex) {
         if (startIndex >= tokens.size()) return true;
-
+        
         // RULE 1: The very first byte MUST be solid (Industry Standard)
         // This prevents signatures like "? 8B EC" which break some C++ scanners.
         if (tokens.get(startIndex).contains("?")) return true;
-
+        
         // RULE 2: Check density of the first few bytes
         int checkLen = Math.min(HEAD_CHECK_SPAN, tokens.size() - startIndex);
         int wildcards = 0;
         for (int k = 0; k < checkLen; k++) {
             if (tokens.get(startIndex + k).contains("?")) wildcards++;
         }
-        
         // If more than 50% of the head is wildcards, consider it weak
         return wildcards > (checkLen / 2);
     }
@@ -212,10 +239,15 @@ public class Sigga extends GhidraScript {
     //  MASKING & TOKENIZATION
     // ============================================================================================
 
-    private List<String> tokenizeInstructions(List<Instruction> instructions, MaskProfile profile) throws MemoryAccessException {
+    private TokenData tokenizeInstructions(List<Instruction> instructions, MaskProfile profile) throws MemoryAccessException {
         List<String> allTokens = new ArrayList<>();
+        Set<Integer> starts = new HashSet<>();
         
+        int currentOffset = 0;
+
         for (Instruction insn : instructions) {
+            starts.add(currentOffset);
+
             String[] tokens = new String[insn.getLength()];
             byte[] bytes = insn.getBytes();
             
@@ -224,20 +256,22 @@ public class Sigga extends GhidraScript {
                 tokens[i] = String.format("%02X", bytes[i]);
             }
 
-            // 2. Mask Relocations (Absolute addresses are always volatile)
+            // 2. Mask relocations (absolute addresses are volatile)
             maskRelocations(insn, tokens);
-
-            // 3. Mask Branches (JMP/CALL/JCC)
+            // 3. Mask branches (JMP/CALL/JCC) which always carry variable displacements
             maskBranches(insn, tokens);
 
             if (profile == MaskProfile.STRICT) {
-                // 4. Aggressive analysis (Data refs, external syms, RIP-relative)
+                // 4. Aggressively mask operands that reference data/external symbols
                 maskOperandsSmart(insn, tokens);
             }
 
-            allTokens.addAll(Arrays.asList(tokens));
+            for (String t : tokens) {
+                allTokens.add(t);
+            }
+            currentOffset += tokens.length;
         }
-        return allTokens;
+        return new TokenData(allTokens, starts);
     }
 
     private void maskRelocations(Instruction insn, String[] tokens) {
@@ -249,9 +283,8 @@ public class Sigga extends GhidraScript {
         while (rels.hasNext()) {
             Relocation r = rels.next();
             int offset = (int) r.getAddress().subtract(start);
-            
             // Default mask length 4
-            int len = 4; 
+            int len = 4;
             for (int i = 0; i < len && (offset + i) < tokens.length; i++) {
                 tokens[offset + i] = "?";
             }
@@ -260,16 +293,16 @@ public class Sigga extends GhidraScript {
 
     private void maskBranches(Instruction insn, String[] tokens) {
         if (insn.getFlowType().isCall() || insn.getFlowType().isJump()) {
-            // Heuristic: If byte 0 is E8 (CALL) or E9 (JMP), mask rest (rel32)
             int b0 = Integer.parseInt(tokens[0], 16);
+            // Heuristic: mask rel32 for CALL/JMP (E8/E9) to avoid volatile branch targets
             if (b0 == 0xE8 || b0 == 0xE9) {
                 for (int i = 1; i < tokens.length; i++) tokens[i] = "?";
             }
-            // Short jumps (EB / 7x)
+            // Short jumps (EB / 7x) – mask the displacement byte
             else if (tokens.length == 2 && (b0 == 0xEB || (b0 & 0xF0) == 0x70)) {
                  tokens[1] = "?";
             }
-            // Long conditional (0F 8x)
+            // Long conditional (0F 8x) – mask displacement dword
             else if (tokens.length >= 6 && b0 == 0x0F && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
                 for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
             }
@@ -286,28 +319,17 @@ public class Sigga extends GhidraScript {
 
         int numOps = insn.getNumOperands();
         for (int op = 0; op < numOps; op++) {
-            
             boolean shouldMask = false;
             Reference[] refs = insn.getOperandReferences(op);
 
-            // Check if references point to External or Data
             for (Reference ref : refs) {
                 Address toAddr = ref.getToAddress();
                 if (toAddr == null) continue;
-
-                if (toAddr.isExternalAddress()) {
-                    shouldMask = true; 
-                    break;
-                }
-                
+                if (toAddr.isExternalAddress()) { shouldMask = true; break; }
                 MemoryBlock block = getMemoryBlock(toAddr);
-                if (block != null && !block.isExecute()) {
-                    shouldMask = true;
-                    break;
-                }
+                if (block != null && !block.isExecute()) { shouldMask = true; break; }
             }
 
-            // Check Scalars (Immediate values that might be addresses)
             if (!shouldMask) {
                 Object[] opObjects = insn.getOpObjects(op);
                 for (Object obj : opObjects) {
@@ -318,9 +340,7 @@ public class Sigga extends GhidraScript {
                         if (val > 0x10000) {
                             Address possibleAddr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(val);
                             MemoryBlock block = getMemoryBlock(possibleAddr);
-                            if (block != null && !block.isExecute()) {
-                                shouldMask = true;
-                            }
+                            if (block != null && !block.isExecute()) shouldMask = true;
                         }
                     }
                 }
@@ -328,20 +348,18 @@ public class Sigga extends GhidraScript {
 
             if (shouldMask) {
                 // If we found a data ref, we need to mask the bytes in the instruction that define it.
-                // 1. RIP-relative search
+                // 1. RIP-relative search – locate displacement bytes that encode the data target
                 for (Reference ref : refs) {
                     Address toAddr = ref.getToAddress();
                     if (toAddr != null) {
                         long target = toAddr.getOffset();
                         long instrEnd = insn.getAddress().add(bytes.length).getOffset();
                         long disp = target - instrEnd; 
-                        
                         // Search for the displacement (4 bytes)
                         maskValueInBytes(tokens, bytes, disp, 4);
                     }
                 }
-
-                // 2. Absolute Scalar search
+                // 2. Absolute scalar search – mask immediates that look like pointers
                 Object[] opObjects = insn.getOpObjects(op);
                 for (Object obj : opObjects) {
                     if (obj instanceof Scalar) {
@@ -358,9 +376,7 @@ public class Sigga extends GhidraScript {
             // Heuristic: Mask the last 4 bytes if the instruction is long enough (>= 5 bytes)
             if (tokens.length >= 5) {
                 int maskStart = tokens.length - 4;
-                for (int i = maskStart; i < tokens.length; i++) {
-                    tokens[i] = "?";
-                }
+                for (int i = maskStart; i < tokens.length; i++) tokens[i] = "?";
             }
         }
     }
@@ -382,28 +398,21 @@ public class Sigga extends GhidraScript {
      */
     private void maskValueInBytes(String[] tokens, byte[] bytes, long value, int size) {
         if (size > 8 || bytes.length < size) return;
-        
         for (int i = 0; i <= bytes.length - size; i++) {
             long currentVal = 0;
             // Read bytes as little endian
-            for (int k = 0; k < size; k++) {
-                currentVal |= ((long)(bytes[i+k] & 0xFF)) << (k*8);
-            }
+            for (int k = 0; k < size; k++) currentVal |= ((long)(bytes[i+k] & 0xFF)) << (k*8);
             
             // Mask if matches (handle 32-bit sign extension comparison)
             boolean match = false;
-            if (size == 4) {
-                 if ((int)currentVal == (int)value) match = true;
-            } else {
-                if (currentVal == value) match = true;
-            }
+            if (size == 4) { if ((int)currentVal == (int)value) match = true; } 
+            else { if (currentVal == value) match = true; }
 
             if (match) {
                 for (int k=0; k<size; k++) tokens[i+k] = "?";
             }
         }
     }
-
 
     // ============================================================================================
     //  XREF FALLBACK LOGIC
@@ -420,40 +429,36 @@ public class Sigga extends GhidraScript {
             Function callerFunc = getFunctionContaining(callSite);
             if (callerFunc == null) continue;
 
-            // Strategy: Signature the [Call Instruction] + [Next Few Instructions]
             List<Instruction> context = new ArrayList<>();
             Instruction insn = getInstructionAt(callSite); 
-            
             if (insn == null) continue;
             context.add(insn);
-            
+            // Strategy: Signature the call instruction plus the next few instructions for unique context.
             Instruction next = insn.getNext();
             for(int k=0; k<XREF_CONTEXT_INSTRUCTIONS && next != null; k++) {
                  context.add(next);
                  next = next.getNext();
             }
 
-            // Tokenize STRICT
-            List<String> tokens = tokenizeInstructions(context, MaskProfile.STRICT);
-            
+            TokenData data = tokenizeInstructions(context, MaskProfile.STRICT);
             StringBuilder sb = new StringBuilder();
-            for(String t : tokens) sb.append(t).append(" ");
+            for(String t : data.tokens) sb.append(t).append(" ");
             String fullSig = sb.toString().trim();
             
             if (isSignatureUnique(fullSig)) {
-                return new SigResult(fullSig, callSite, 0, 80);
+                return new SigResult(fullSig, callSite, 0, 80, "Tier 3 (XRef / Caller)");
             }
         }
         return null;
     }
 
-
     // ============================================================================================
     //  UTILITIES
     // ============================================================================================
 
-    private boolean isSignatureUnique(String sigStr) {
+    private boolean isSignatureUnique(String sigStr) throws CancelledException {
         try {
+            monitor.checkCancelled();
             ByteSignature sig = new ByteSignature(sigStr);
             Memory mem = currentProgram.getMemory();
             
@@ -463,8 +468,9 @@ public class Sigga extends GhidraScript {
             
             // Find second match (starting 1 byte after first)
             Address secondMatch = mem.findBytes(firstMatch.add(1), currentProgram.getMaxAddress(), sig.bytes, sig.mask, true, monitor);
-            
             return secondMatch == null;
+        } catch (CancelledException e) {
+            throw e;
         } catch (Exception e) {
             return false;
         }
