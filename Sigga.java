@@ -405,15 +405,6 @@ public class Sigga extends GhidraScript {
                 }
             }
         }
-
-        // Catch-all: Mask displacements in LEA or Stack ops to be safe against stack reordering
-        if (insn.getMnemonicString().equals("LEA") || hasStackReg(insn)) {
-            // Heuristic: Mask the last 4 bytes if the instruction is long enough (>= 5 bytes)
-            if (tokens.length >= 5) {
-                int maskStart = tokens.length - 4;
-                for (int i = maskStart; i < tokens.length; i++) tokens[i] = "?";
-            }
-        }
     }
 
     private boolean hasStackReg(Instruction insn) {
