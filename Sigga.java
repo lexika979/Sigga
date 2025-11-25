@@ -207,16 +207,44 @@ public class Sigga extends GhidraScript {
                 // Check uniqueness
                 String currentSig = sigBuilder.toString();
                 if (isSignatureUnique(currentSig)) {
+                    // CLEANUP: Trim trailing wildcards if possible (e.g. "A B ? ?" -> "A B")
+                    String finalSig = trimTrailingWildcards(currentSig);
+                    
                     // Found a unique sig. Classify it.
                     boolean solidHead = !isHeadWeak(tokens, i);
                     String tier = solidHead ? "Tier 1 (High Stability, Direct)" : "Tier 2 (High Stability, Loose Head)";
                     int quality = solidHead ? 100 : 90;
-                    // Offset matches the sliding window start index because tokens map 1:1 with bytes.
-                    return new SigResult(currentSig, startAddr, i, quality, tier);
+                    
+                    return new SigResult(finalSig, startAddr, i, quality, tier);
                 }
             }
         }
         return null;
+    }
+
+    private String trimTrailingWildcards(String sig) {
+        String[] parts = sig.split(" ");
+        int trimCount = 0;
+        // Count trailing wildcards
+        for (int i = parts.length - 1; i >= 0; i--) {
+            if (parts[i].equals("?")) trimCount++;
+            else break;
+        }
+        
+        if (trimCount == 0) return sig;
+
+        // Ensure we don't trim below minimum length
+        if (parts.length - trimCount < MIN_WINDOW_BYTES) {
+            trimCount = parts.length - MIN_WINDOW_BYTES;
+            if (trimCount <= 0) return sig;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < parts.length - trimCount; i++) {
+            if (i > 0) sb.append(" ");
+            sb.append(parts[i]);
+        }
+        return sb.toString();
     }
 
     private boolean isHeadWeak(List<String> tokens, int startIndex) {
@@ -453,7 +481,8 @@ public class Sigga extends GhidraScript {
             String fullSig = sb.toString().trim();
             
             if (isSignatureUnique(fullSig)) {
-                return new SigResult(fullSig, callSite, 0, 80, "Tier 3 (XRef / Caller)");
+                String finalSig = trimTrailingWildcards(fullSig);
+                return new SigResult(finalSig, callSite, 0, 80, "Tier 3 (XRef / Caller)");
             }
         }
         return null;
