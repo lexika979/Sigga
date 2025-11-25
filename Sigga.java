@@ -11,7 +11,6 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
-import ghidra.program.model.lang.OperandType;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
@@ -405,18 +404,6 @@ public class Sigga extends GhidraScript {
                 }
             }
         }
-    }
-
-    private boolean hasStackReg(Instruction insn) {
-        for (int i=0; i<insn.getNumOperands(); i++) {
-             for (Object o : insn.getOpObjects(i)) {
-                 if (o instanceof Register) {
-                     String n = ((Register)o).getName().toUpperCase();
-                     if (n.contains("SP") || n.contains("BP")) return true;
-                 }
-             }
-        }
-        return false;
     }
 
     /**
