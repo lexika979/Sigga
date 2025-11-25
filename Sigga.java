@@ -33,11 +33,11 @@ import java.util.*;
 public class Sigga extends GhidraScript {
 
     // --- CONFIGURATION ---
-    private static final int MAX_INSTRUCTIONS_TO_SCAN = 300;
+    private static final int MAX_INSTRUCTIONS_TO_SCAN = 200;
     private static final int MIN_WINDOW_BYTES = 5;    // Minimum length of a sig
-    private static final int MAX_WINDOW_BYTES = 120;  // Maximum length of a sig; capped to avoid endless scans
+    private static final int MAX_WINDOW_BYTES = 128;  // Maximum length of a sig; capped to avoid endless scans
     private static final int HEAD_CHECK_SPAN = 3;     // First N bytes to check for stability
-    private static final int XREF_CONTEXT_INSTRUCTIONS = 12; // How many instructions to grab for XRef sigs
+    private static final int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
     private static final int MAX_START_OFFSET = 64;   // Only start sigs within first 64 bytes of function
 
     /**
@@ -179,7 +179,8 @@ public class Sigga extends GhidraScript {
             // 1. Only start at instruction boundaries
             if (!data.instructionStartIndices.contains(i)) continue;
             // 2. Limit start depth (don't scan deep into massive functions)
-            if (i > MAX_START_OFFSET) break;
+            // Use >= to match the logic of "first X bytes" (0-indexed)
+            if (i >= MAX_START_OFFSET) break;
 
             StringBuilder sigBuilder = new StringBuilder();
             int byteCount = 0;
@@ -196,8 +197,8 @@ public class Sigga extends GhidraScript {
 
                 // 3. OPTIMIZATION: Only check uniqueness if we represent a full instruction.
                 // We assume we are at the end of an instruction if (j+1) is the start of a new one,
-                // or if we are at the very end of the list.
-                boolean isInstructionEnd = data.instructionStartIndices.contains(j + 1) || j == n - 1;
+                // or if we have reached the total token count.
+                boolean isInstructionEnd = (j + 1 == n) || data.instructionStartIndices.contains(j + 1);
                 
                 if (!isInstructionEnd) {
                     continue; 
@@ -293,6 +294,9 @@ public class Sigga extends GhidraScript {
 
     private void maskBranches(Instruction insn, String[] tokens) {
         if (insn.getFlowType().isCall() || insn.getFlowType().isJump()) {
+            // Safety check: if byte 0 was already masked by relocation, don't parse it
+            if (tokens[0].contains("?")) return;
+
             int b0 = Integer.parseInt(tokens[0], 16);
             // Heuristic: mask rel32 for CALL/JMP (E8/E9) to avoid volatile branch targets
             if (b0 == 0xE8 || b0 == 0xE9) {
@@ -303,8 +307,11 @@ public class Sigga extends GhidraScript {
                  tokens[1] = "?";
             }
             // Long conditional (0F 8x) – mask displacement dword
-            else if (tokens.length >= 6 && b0 == 0x0F && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
-                for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
+            else if (tokens.length >= 6 && b0 == 0x0F) {
+                // Safety check for 0F 8x check
+                if (!tokens[1].contains("?") && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
+                    for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
+                }
             }
         }
     }
