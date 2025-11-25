@@ -8,31 +8,25 @@ This script contains the core functionality of signature creation, plus advanced
 
 - **One-Click Generation:** Runs immediately without configuration dialogs.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
-- **Fast & Efficient 'Sliding Window' Search:** A modern algorithm finds the smallest possible signature and is exponentially faster on large binaries than the original version.
+- **Fast & Efficient:** A modern sliding-window algorithm with **instruction alignment enforcement** ensures signatures are generated instantly, even for large or generic functions.
 - **Signature by Cross-Reference (XRef) Fallback:** If a function's code is too generic to be unique (like a compiler-generated `memcpy`), Sigga will automatically create a signature for the code that *calls* it. This allows it to succeed where many other sigmakers fail.
 - **Intelligent Stability Analysis:** The logic for what to wildcard is highly advanced, including static data references (`[RIP + disp]`) to create far more robust signatures that are more likely to survive game updates.
 - **Professional Offset Signatures:** The script produces industry-standard signatures with offsets, avoiding problematic leading wildcards.
 
 ## Installation
-To install Sigga, simply [download the latest release](https://github.com/lexika979/Sigga/releases) and put *Sigga.java* inside C:/Users/(your username)/ghidra_scripts. If the folder does not exist yet, create it first. - That's it!
+To get the latest version with all performance fixes, download **Sigga.java** directly from the source:
 
-I highly recommend binding Sigga to a shortcut to save yourself a lot of clicks. You can do so like this:
+👉 **[Download Sigga.java](https://github.com/lexika979/Sigga/blob/main/Sigga.java)**
 
-1) Open Ghidra and the Script manager:
+*(Note: The [Releases page](https://github.com/lexika979/Sigga/releases) may not always contain the most recent logic updates.)*
 
-![](https://i.imgur.com/usOQWPh.png)
+**Setup:**
+1.  Place `Sigga.java` inside `C:/Users/(your username)/ghidra_scripts`. If the folder does not exist yet, create it first.
+2.  Open Ghidra and the Script Manager.
+3.  Open the "Functions" folder.
+4.  Right click "Sigga" and assign a keybind (I recommend *Ctrl-Alt-S*).
 
-2) Open the "Functions" folder:
-
-![](https://i.imgur.com/sIxclgU.png)
-
-3) Right click "Sigga" and assign a keybind (I recommend *Ctrl-Alt-S*):
-
-![](https://i.imgur.com/N7kSe4F.png)
-
-Troubleshooting: In case Sigga does not show up in the list, try to create a new script through the UI and immediately delete it again. That should force Ghidra to acknowledge the ghidra_scripts directory.
-
-Done!
+*Troubleshooting: In case Sigga does not show up in the list, try to create a new script through the UI and immediately delete it again to force a refresh.*
 
 ## Sigga in action
 
@@ -40,7 +34,20 @@ Select any function (or place your cursor inside one) and press your assigned ke
 
 Sigga will immediately analyze the function, find the best possible signature (checking Direct, XRef, and Fallback tiers), and **automatically copy it to your clipboard**.
 
-Check the Ghidra Console window for details on the generated signature quality and offset.
+Results are printed to the **Ghidra Console**:
+
+```text
+Sigga: Analyzing FUN_00975aa0 @ 00975aa0
+==================================================
+ SIGGA SUCCESS - Tier 1 (High Stability, Direct)
+==================================================
+Signature:  48 83 EC 28 48 8B 05 ? ? ? ? 48 85 C0
+Address:    00975aa0
+Offset:     +0
+Quality:    100/100
+==================================================
+>> Copied to clipboard.
+```
 
 ## Contributing/Bug reporting
 
