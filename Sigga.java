@@ -1,6 +1,6 @@
-// A massively improved sigmaker for Ghidra
-// This version includes a fast "Sliding Window" algorithm and a powerful "XRef Fallback"
-// to create reliable signatures for even the most complex, non-unique functions.
+//A robust, patch-resistant signature generator for Ghidra.
+//Combines sliding-window algorithms, XRef detection, and aggressive smart-masking.
+//Automatically retries with lower strictness if a unique signature cannot be found.
 //@author lexika, Krixx1337, outercloudstudio
 //@category Functions
 //@keybinding
@@ -10,6 +10,7 @@
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
+import ghidra.program.model.address.AddressSetView;
 import ghidra.program.model.lang.OperandType;
 import ghidra.program.model.lang.Register;
 import ghidra.program.model.listing.Function;
@@ -27,609 +28,489 @@ import ghidra.util.exception.CancelledException;
 import java.awt.Toolkit;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Iterator;
-import java.util.LinkedList;
-import java.util.List;
+import java.util.*;
 
 public class Sigga extends GhidraScript {
 
     // --- CONFIGURATION ---
-    private static final int MAX_INSTRUCTIONS_TO_SCAN = 256;
-    private static final int MIN_WINDOW_BYTES = 16;
-    private static final int MAX_WINDOW_BYTES = 64;
-    private static final int XREF_SIG_INSTRUCTIONS = 8; // How many instructions to use for an XRef signature.
-    private static final int HEAD_CHECK_SPAN = 6;   // how many tokens to inspect from the start
-    private static final int HEAD_MIN_SOLID  = 6;   // require at least this many non "?" in that span
+    private static final int MAX_INSTRUCTIONS_TO_SCAN = 300;
+    private static final int MIN_WINDOW_BYTES = 5;    // Minimum length of a sig
+    private static final int MAX_WINDOW_BYTES = 150;  // Maximum length of a sig
+    private static final int HEAD_CHECK_SPAN = 3;     // First N bytes to check for stability
+    private static final int XREF_CONTEXT_INSTRUCTIONS = 12; // How many instructions to grab for XRef sigs
 
     /**
-     * Helper class to convert a string signature to bytes + mask.
+     * Enum to control how aggressive the masking logic is.
      */
-    private static class ByteSignature {
-        private byte[] bytes;
-        private byte[] mask;
-
-        public ByteSignature(String signature) {
-            parseSignature(signature);
-        }
-
-        /**
-         * Parses a string signature (like "56 8B ? ? 06") into byte and mask arrays.
-         *
-         * @param signature The string-format signature to parse.
-         * @throws IllegalArgumentException If the signature has an invalid format.
-         */
-        private void parseSignature(String signature) throws IllegalArgumentException {
-            String cleanSignature = signature.replaceAll("\\s", "");
-            if (cleanSignature.isEmpty()) {
-                throw new IllegalArgumentException("Signature cannot be empty.");
-            }
-
-            List<Byte> byteList = new LinkedList<>();
-            List<Byte> maskList = new LinkedList<>();
-
-            for (int i = 0; i < cleanSignature.length();) {
-                char character = cleanSignature.charAt(i);
-                if (character == '?') {
-                    byteList.add((byte) 0x00);
-                    maskList.add((byte) 0x00);
-                    i++;
-                    continue;
-                }
-
-                try {
-                    byte value = (byte) Integer.parseInt(cleanSignature.substring(i, i + 2), 16);
-                    byteList.add(value);
-                    maskList.add((byte) 0xFF);
-                    i += 2;
-                } catch (NumberFormatException | StringIndexOutOfBoundsException e) {
-                    throw new IllegalArgumentException("Invalid hex character or wildcard in signature.", e);
-                }
-            }
-            this.bytes = toByteArray(byteList);
-            this.mask = toByteArray(maskList);
-        }
-
-        private byte[] toByteArray(List<Byte> list) {
-            byte[] array = new byte[list.size()];
-            for (int i = 0; i < list.size(); i++) {
-                array[i] = list.get(i);
-            }
-            return array;
-        }
-
-        public byte[] getBytes() { return bytes; }
-        public byte[] getMask() { return mask; }
+    private enum MaskProfile {
+        STRICT,    // Mask anything that looks like an address, offset, or variable (Best for patches)
+        MINIMAL    // Only mask relocations and direct branches (Desperation mode)
     }
 
     /**
-     * Helper class to store a window with its starting instruction address.
+     * Container for a generated signature.
      */
-    private static class WindowWithOffset {
-        private List<String> window;
-        private Address startAddress;
+    private static class SigResult {
+        String signature;
+        Address address;
+        long offset; // Offset from start of function/block
+        int quality; // 100 = Best, 0 = Worst
 
-        public WindowWithOffset(List<String> window, Address startAddress) {
-            this.window = window;
-            this.startAddress = startAddress;
-        }
-
-        public List<String> getWindow() { return window; }
-        public Address getStartAddress() { return startAddress; }
-    }
-
-    /**
-     * Helper class to store scan results and debug information.
-     */
-    private static class ScanResult {
-        boolean success;
-        int totalWindows;
-        int windowsPassedHeadCheck;
-        int windowsTestedForUniqueness;
-        List<String> sampleRejectedWindows;
-        List<String> testedSignatures;
-
-        public ScanResult(boolean success, int totalWindows, int windowsPassedHeadCheck, 
-                         int windowsTestedForUniqueness, List<String> sampleRejectedWindows, List<String> testedSignatures) {
-            this.success = success;
-            this.totalWindows = totalWindows;
-            this.windowsPassedHeadCheck = windowsPassedHeadCheck;
-            this.windowsTestedForUniqueness = windowsTestedForUniqueness;
-            this.sampleRejectedWindows = sampleRejectedWindows;
-            this.testedSignatures = testedSignatures;
+        public SigResult(String signature, Address address, long offset, int quality) {
+            this.signature = signature;
+            this.address = address;
+            this.offset = offset;
+            this.quality = quality;
         }
     }
 
-    /**
-     * The script entry point.
-     */
     @Override
     public void run() throws Exception {
-        String action = askChoice("Sigga", "Choose an action:", Arrays.asList("Create Signature", "Find Signature"), "Create Signature");
-        if ("Create Signature".equals(action)) {
-            createSignature();
-        } else if ("Find Signature".equals(action)) {
-            findSignature();
-        }
-    }
-
-    /**
-     * Main function to create a signature for the function at the current cursor location.
-     * Uses a two-phase approach: direct scan, then XRef fallback scan.
-     */
-    private void createSignature() throws MemoryAccessException, CancelledException {
         if (currentLocation == null) {
-            printerr("No current location.");
-            return;
-        }
-        Function function = getFunctionContaining(currentLocation.getAddress());
-        if (function == null) {
-            printerr("No function selected.");
-            return;
-        }
-        if (function.isThunk()) { // skip import thunks and stubs
-            println("Selected function is a thunk, trying XRef fallback.");
-            tryXRefSignature(function);
+            printerr("Sigga: No cursor location found. Please run this script from the Listing window.");
             return;
         }
 
-        println("Phase 1: Scanning for a direct signature in: " + function.getName());
-
-        ScanResult result = tryDirectSignatureWithStrictness(function, HEAD_MIN_SOLID);
-        if (result.success) {
+        Function func = getFunctionContaining(currentLocation.getAddress());
+        if (func == null) {
+            printerr("Sigga: Cursor is not inside a function.");
             return;
         }
 
-        // Phase 1 failed - show interactive prompt
-        String choice = askChoice("Phase 1 Failed", 
-            "Direct signature scan failed. What would you like to do?",
-            Arrays.asList("Try with lower strictness", "Proceed to XRef fallback", "Show debug information"),
-            "Proceed to XRef fallback");
+        println("Sigga: Analyzing " + func.getName() + " @ " + func.getEntryPoint());
+        generateSignatureRoutine(func);
+    }
 
-        if ("Try with lower strictness".equals(choice)) {
-            println("Retrying with lower strictness (HEAD_MIN_SOLID: 4 instead of 6)...");
-            ScanResult retryResult = tryDirectSignatureWithStrictness(function, 4);
-            if (retryResult.success) {
-                return;
-            }
-            println("Retry with lower strictness also failed. Proceeding to XRef fallback.");
-            tryXRefSignature(function);
-        } else if ("Show debug information".equals(choice)) {
-            showDebugInformation(result);
-            String afterDebug = askChoice("Debug Info Shown", 
-                "What would you like to do now?",
-                Arrays.asList("Try with lower strictness", "Proceed to XRef fallback"),
-                "Proceed to XRef fallback");
-            if ("Try with lower strictness".equals(afterDebug)) {
-                println("Retrying with lower strictness (HEAD_MIN_SOLID: 4 instead of 6)...");
-                ScanResult retryResult = tryDirectSignatureWithStrictness(function, 4);
-                if (retryResult.success) {
-                    return;
-                }
-                println("Retry with lower strictness also failed. Proceeding to XRef fallback.");
-            }
-            tryXRefSignature(function);
-        } else {
-            println("Proceeding to Phase 2: Signature by Cross-Reference (XRef).");
-            tryXRefSignature(function);
+    // ============================================================================================
+    //  GENERATION LOGIC
+    // ============================================================================================
+
+    private void generateSignatureRoutine(Function func) throws Exception {
+        // --- TIER 1 & 2: DIRECT SCAN ---
+        List<Instruction> instructions = getInstructions(func.getBody(), MAX_INSTRUCTIONS_TO_SCAN);
+        List<String> strictTokens = tokenizeInstructions(instructions, MaskProfile.STRICT);
+        
+        // Tier 1: Strict Masking + Solid Head (The "Perfect" Sig)
+        // Must start with a real byte (not ?), masks all offsets.
+        SigResult result = findCheapestSignature(strictTokens, func.getEntryPoint(), true);
+        if (result != null) {
+            finish(result, "Tier 1 (High Stability, Direct)");
+            return;
         }
+        
+        println("... Tier 1 failed (No unique signature with strict masking & solid head).");
+
+        // Tier 2: Strict Masking + Loose Head
+        // Allows wildcards at the start if necessary.
+        result = findCheapestSignature(strictTokens, func.getEntryPoint(), false);
+        if (result != null) {
+            finish(result, "Tier 2 (High Stability, Loose Head)");
+            return;
+        }
+
+        println("... Tier 2 failed. Function is likely a duplicate or generic wrapper.");
+
+        // --- TIER 3: XREF SCAN ---
+        // If the function itself is not unique (e.g., a thunk), scan the callers.
+        result = tryXRefSignature(func);
+        if (result != null) {
+            finish(result, "Tier 3 (XRef / Caller)");
+            return;
+        }
+
+        println("... Tier 3 failed (No unique XRefs found).");
+
+        // --- TIER 4: DESPERATION ---
+        // Re-tokenize with minimal masking.
+        List<String> looseTokens = tokenizeInstructions(instructions, MaskProfile.MINIMAL);
+        result = findCheapestSignature(looseTokens, func.getEntryPoint(), false);
+        
+        if (result != null) {
+            finish(result, "Tier 4 (Low Stability / Desperation)");
+            return;
+        }
+
+        popup("Failed to generate a unique signature. \n\n" +
+              "This function appears to be identical to many others in the binary \n" +
+              "and has no unique cross-references.");
+    }
+
+    private void finish(SigResult result, String tierName) {
+        println("\n==================================================");
+        println(" SIGGA SUCCESS - " + tierName);
+        println("==================================================");
+        println("Signature:  " + result.signature);
+        println("Address:    " + result.address);
+        println("Offset:     +" + Long.toHexString(result.offset).toUpperCase());
+        println("Quality:    " + result.quality + "/100");
+        println("==================================================");
+
+        copyToClipboard(result.signature);
+        println(">> Copied to clipboard.");
     }
 
     /**
-     * Attempts to find a direct signature with configurable strictness.
-     *
-     * @param function The function to scan
-     * @param headMinSolid The minimum number of solid bytes required in the head check
-     * @return ScanResult containing success status and debug information
+     * The Sliding Window Algorithm.
+     * Finds the shortest unique substring of tokens.
      */
-    private ScanResult tryDirectSignatureWithStrictness(Function function, int headMinSolid) 
-            throws MemoryAccessException, CancelledException {
-        List<WindowWithOffset> windows = buildInstructionWindows(function, MAX_INSTRUCTIONS_TO_SCAN, MIN_WINDOW_BYTES, MAX_WINDOW_BYTES);
-        Address functionStart = function.getEntryPoint();
-        
-        int totalWindows = windows.size();
-        int windowsPassedHeadCheck = 0;
-        int windowsTestedForUniqueness = 0;
-        List<String> sampleRejectedWindows = new LinkedList<>();
-        List<String> testedSignatures = new LinkedList<>();
-        final int MAX_SAMPLE_WINDOWS = 5;
-        final int MAX_TESTED_SIGNATURES = 5;
+    private SigResult findCheapestSignature(List<String> tokens, Address startAddr, boolean requireSolidHead) throws CancelledException {
+        int n = tokens.size();
 
-        for (WindowWithOffset windowWithOffset : windows) {
+        // Iterate through all possible start positions (i)
+        for (int i = 0; i < n; i++) {
             monitor.checkCancelled();
-            List<String> w = windowWithOffset.getWindow();
-            
-            if (!goodHead(w, headMinSolid)) {
-                if (sampleRejectedWindows.size() < MAX_SAMPLE_WINDOWS) {
-                    String sample = String.join(" ", w.subList(0, Math.min(20, w.size())));
-                    sampleRejectedWindows.add(sample + (w.size() > 20 ? "..." : ""));
-                }
+            StringBuilder sigBuilder = new StringBuilder();
+            int byteCount = 0;
+
+            // Optimization: If requireSolidHead is true, skip windows starting with wildcard
+            if (requireSolidHead && isHeadWeak(tokens, i)) {
                 continue;
             }
-            
-            windowsPassedHeadCheck++;
-            String sig = String.join(" ", w);
-            windowsTestedForUniqueness++;
-            
-            if (testedSignatures.size() < MAX_TESTED_SIGNATURES) {
-                String sigSample = sig.length() > 80 ? sig.substring(0, 80) + "..." : sig;
-                testedSignatures.add(sigSample);
-            }
-            
-            if (isSignatureUniqueInBinary(sig)) {
-                long offset = windowWithOffset.getStartAddress().subtract(functionStart);
-                String finalOutput = String.format("Signature: \"%s\" (Offset: %d)", sig, offset);
-                copyToClipboard(sig);
-                println("Found unique direct signature!");
-                println(finalOutput + " - Signature text copied to clipboard.");
-                return new ScanResult(true, totalWindows, windowsPassedHeadCheck, windowsTestedForUniqueness, null, null);
+
+            // Grow the window (j)
+            for (int j = i; j < n; j++) {
+                String tok = tokens.get(j);
+                if (sigBuilder.length() > 0) sigBuilder.append(" ");
+                sigBuilder.append(tok);
+                byteCount++;
+
+                if (byteCount < MIN_WINDOW_BYTES) continue;
+                if (byteCount > MAX_WINDOW_BYTES) break; // Window too big, move start index
+
+                // Check uniqueness
+                String currentSig = sigBuilder.toString();
+                if (isSignatureUnique(currentSig)) {
+                    // Offset calculation:
+                    // Since 'tokens' corresponds 1-to-1 with bytes in the function body,
+                    // the offset is simply the start index 'i'.
+                    return new SigResult(currentSig, startAddr, i, 100);
+                }
             }
         }
-
-        return new ScanResult(false, totalWindows, windowsPassedHeadCheck, windowsTestedForUniqueness, sampleRejectedWindows, testedSignatures);
+        return null;
     }
 
-    /**
-     * Displays debug information about why Phase 1 failed.
-     */
-    private void showDebugInformation(ScanResult result) {
-        println("=== Debug Information ===");
-        println("Total windows generated: " + result.totalWindows);
-        println("Windows passing head check (HEAD_MIN_SOLID=" + HEAD_MIN_SOLID + "): " + result.windowsPassedHeadCheck);
-        println("Windows tested for uniqueness: " + result.windowsTestedForUniqueness);
+    private boolean isHeadWeak(List<String> tokens, int startIndex) {
+        if (startIndex >= tokens.size()) return true;
+
+        // RULE 1: The very first byte MUST be solid (Industry Standard)
+        // This prevents signatures like "? 8B EC" which break some C++ scanners.
+        if (tokens.get(startIndex).contains("?")) return true;
+
+        // RULE 2: Check density of the first few bytes
+        int checkLen = Math.min(HEAD_CHECK_SPAN, tokens.size() - startIndex);
+        int wildcards = 0;
+        for (int k = 0; k < checkLen; k++) {
+            if (tokens.get(startIndex + k).contains("?")) wildcards++;
+        }
         
-        if (result.windowsPassedHeadCheck == 0) {
-            println("\nReason: No windows passed the head check (too many wildcards at the start).");
-            println("All windows were rejected because they didn't have enough solid bytes in the first " + HEAD_CHECK_SPAN + " tokens.");
-            if (result.sampleRejectedWindows != null && !result.sampleRejectedWindows.isEmpty()) {
-                println("\nSample rejected windows (first " + result.sampleRejectedWindows.size() + "):");
-                for (String sample : result.sampleRejectedWindows) {
-                    println("  " + sample);
-                }
-            }
-        } else if (result.windowsTestedForUniqueness > 0) {
-            println("\nReason: All tested windows were not unique (found multiple matches in the binary).");
-            println("This function likely has very common patterns that appear in multiple places.");
-            if (result.testedSignatures != null && !result.testedSignatures.isEmpty()) {
-                println("\nSignatures that were tested (passed head check but failed uniqueness):");
-                for (String sig : result.testedSignatures) {
-                    println("  " + sig);
-                }
-            }
-        }
-        println("========================");
+        // If more than 50% of the head is wildcards, consider it weak
+        return wildcards > (checkLen / 2);
     }
 
-    private List<WindowWithOffset> buildInstructionWindows(Function f, int maxInsns, int minBytes, int maxBytes) throws MemoryAccessException {
-        List<List<String>> perInsn = new LinkedList<>();
-        List<Address> insnAddresses = new LinkedList<>();
-        InstructionIterator it = currentProgram.getListing().getInstructions(f.getBody(), true);
-        while (it.hasNext() && perInsn.size() < maxInsns) {
-            Instruction insn = it.next();
-            perInsn.add(instructionToTokens(insn));
-            insnAddresses.add(insn.getAddress());
+    // ============================================================================================
+    //  MASKING & TOKENIZATION
+    // ============================================================================================
+
+    private List<String> tokenizeInstructions(List<Instruction> instructions, MaskProfile profile) throws MemoryAccessException {
+        List<String> allTokens = new ArrayList<>();
+        
+        for (Instruction insn : instructions) {
+            String[] tokens = new String[insn.getLength()];
+            byte[] bytes = insn.getBytes();
+            
+            // 1. Base tokens (hex)
+            for (int i = 0; i < bytes.length; i++) {
+                tokens[i] = String.format("%02X", bytes[i]);
+            }
+
+            // 2. Mask Relocations (Absolute addresses are always volatile)
+            maskRelocations(insn, tokens);
+
+            // 3. Mask Branches (JMP/CALL/JCC)
+            maskBranches(insn, tokens);
+
+            if (profile == MaskProfile.STRICT) {
+                // 4. Aggressive analysis (Data refs, external syms, RIP-relative)
+                maskOperandsSmart(insn, tokens);
+            }
+
+            allTokens.addAll(Arrays.asList(tokens));
         }
-        List<WindowWithOffset> windows = new LinkedList<>();
-        for (int i = 0; i < perInsn.size(); i++) {
-            List<String> acc = new LinkedList<>();
-            int total = 0;
-            Address startAddr = insnAddresses.get(i);
-            for (int j = i; j < perInsn.size(); j++) {
-                List<String> add = perInsn.get(j);
-                if (total + add.size() > maxBytes) break;
-                acc.addAll(add);
-                total += add.size();
-                if (total >= minBytes) windows.add(new WindowWithOffset(new LinkedList<>(acc), startAddr));
+        return allTokens;
+    }
+
+    private void maskRelocations(Instruction insn, String[] tokens) {
+        Address start = insn.getMinAddress();
+        Address end = insn.getMaxAddress();
+        RelocationTable rt = currentProgram.getRelocationTable();
+        Iterator<Relocation> rels = rt.getRelocations(new AddressSet(start, end));
+
+        while (rels.hasNext()) {
+            Relocation r = rels.next();
+            int offset = (int) r.getAddress().subtract(start);
+            
+            // Default mask length 4
+            int len = 4; 
+            for (int i = 0; i < len && (offset + i) < tokens.length; i++) {
+                tokens[offset + i] = "?";
             }
         }
-        return windows;
     }
 
-    private boolean goodHead(List<String> w, int minSolid) {
-        if (w == null || w.isEmpty()) return false;
-        int span = Math.min(HEAD_CHECK_SPAN, w.size());
-        int solid = 0;
-        for (int i = 0; i < span; i++) {
-            if (!"?".equals(w.get(i))) solid++;
+    private void maskBranches(Instruction insn, String[] tokens) {
+        if (insn.getFlowType().isCall() || insn.getFlowType().isJump()) {
+            // Heuristic: If byte 0 is E8 (CALL) or E9 (JMP), mask rest (rel32)
+            int b0 = Integer.parseInt(tokens[0], 16);
+            if (b0 == 0xE8 || b0 == 0xE9) {
+                for (int i = 1; i < tokens.length; i++) tokens[i] = "?";
+            }
+            // Short jumps (EB / 7x)
+            else if (tokens.length == 2 && (b0 == 0xEB || (b0 & 0xF0) == 0x70)) {
+                 tokens[1] = "?";
+            }
+            // Long conditional (0F 8x)
+            else if (tokens.length >= 6 && b0 == 0x0F && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
+                for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
+            }
         }
-        return solid >= minSolid;
-    }
-
-    private boolean goodHead(List<String> w) {
-        return goodHead(w, HEAD_MIN_SOLID);
     }
 
     /**
-     * Fallback method to find a signature for a function's CALLER.
-     *
-     * @param function The function that could not be signed directly.
+     * The "Paranoid" masking logic.
+     * Identifies operands that point to data/external symbols and masks their byte representation.
      */
-    private void tryXRefSignature(Function function) throws MemoryAccessException, CancelledException {
-        Reference[] refs = getReferencesTo(function.getEntryPoint());
+    private void maskOperandsSmart(Instruction insn, String[] tokens) {
+        byte[] bytes;
+        try { bytes = insn.getBytes(); } catch (Exception e) { return; }
+
+        int numOps = insn.getNumOperands();
+        for (int op = 0; op < numOps; op++) {
+            
+            boolean shouldMask = false;
+            Reference[] refs = insn.getOperandReferences(op);
+
+            // Check if references point to External or Data
+            for (Reference ref : refs) {
+                Address toAddr = ref.getToAddress();
+                if (toAddr == null) continue;
+
+                if (toAddr.isExternalAddress()) {
+                    shouldMask = true; 
+                    break;
+                }
+                
+                MemoryBlock block = getMemoryBlock(toAddr);
+                if (block != null && !block.isExecute()) {
+                    shouldMask = true;
+                    break;
+                }
+            }
+
+            // Check Scalars (Immediate values that might be addresses)
+            if (!shouldMask) {
+                Object[] opObjects = insn.getOpObjects(op);
+                for (Object obj : opObjects) {
+                    if (obj instanceof Scalar) {
+                        Scalar s = (Scalar) obj;
+                        long val = s.getUnsignedValue();
+                        // Ignore small immediates (likely loop counters or offsets < 64KB)
+                        if (val > 0x10000) {
+                            Address possibleAddr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(val);
+                            MemoryBlock block = getMemoryBlock(possibleAddr);
+                            if (block != null && !block.isExecute()) {
+                                shouldMask = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (shouldMask) {
+                // If we found a data ref, we need to mask the bytes in the instruction that define it.
+                // 1. RIP-relative search
+                for (Reference ref : refs) {
+                    Address toAddr = ref.getToAddress();
+                    if (toAddr != null) {
+                        long target = toAddr.getOffset();
+                        long instrEnd = insn.getAddress().add(bytes.length).getOffset();
+                        long disp = target - instrEnd; 
+                        
+                        // Search for the displacement (4 bytes)
+                        maskValueInBytes(tokens, bytes, disp, 4);
+                    }
+                }
+
+                // 2. Absolute Scalar search
+                Object[] opObjects = insn.getOpObjects(op);
+                for (Object obj : opObjects) {
+                    if (obj instanceof Scalar) {
+                        long val = ((Scalar)obj).getUnsignedValue();
+                        maskValueInBytes(tokens, bytes, val, 4); 
+                        maskValueInBytes(tokens, bytes, val, 8); 
+                    }
+                }
+            }
+        }
+
+        // Catch-all: Mask displacements in LEA or Stack ops to be safe against stack reordering
+        if (insn.getMnemonicString().equals("LEA") || hasStackReg(insn)) {
+            // Heuristic: Mask the last 4 bytes if the instruction is long enough (>= 5 bytes)
+            if (tokens.length >= 5) {
+                int maskStart = tokens.length - 4;
+                for (int i = maskStart; i < tokens.length; i++) {
+                    tokens[i] = "?";
+                }
+            }
+        }
+    }
+
+    private boolean hasStackReg(Instruction insn) {
+        for (int i=0; i<insn.getNumOperands(); i++) {
+             for (Object o : insn.getOpObjects(i)) {
+                 if (o instanceof Register) {
+                     String n = ((Register)o).getName().toUpperCase();
+                     if (n.contains("SP") || n.contains("BP")) return true;
+                 }
+             }
+        }
+        return false;
+    }
+
+    /**
+     * Helper to find a value (little endian) in the byte array and mask it.
+     */
+    private void maskValueInBytes(String[] tokens, byte[] bytes, long value, int size) {
+        if (size > 8 || bytes.length < size) return;
+        
+        for (int i = 0; i <= bytes.length - size; i++) {
+            long currentVal = 0;
+            // Read bytes as little endian
+            for (int k = 0; k < size; k++) {
+                currentVal |= ((long)(bytes[i+k] & 0xFF)) << (k*8);
+            }
+            
+            // Mask if matches (handle 32-bit sign extension comparison)
+            boolean match = false;
+            if (size == 4) {
+                 if ((int)currentVal == (int)value) match = true;
+            } else {
+                if (currentVal == value) match = true;
+            }
+
+            if (match) {
+                for (int k=0; k<size; k++) tokens[i+k] = "?";
+            }
+        }
+    }
+
+
+    // ============================================================================================
+    //  XREF FALLBACK LOGIC
+    // ============================================================================================
+
+    private SigResult tryXRefSignature(Function targetFunc) throws Exception {
+        Address funcStart = targetFunc.getEntryPoint();
+        Reference[] refs = getReferencesTo(funcStart);
+        
         for (Reference ref : refs) {
-            monitor.checkCancelled();
-            Address refAddr = ref.getFromAddress();
-            Instruction refInstr = getInstructionAt(refAddr);
+            if (!ref.getReferenceType().isCall()) continue;
             
-            MemoryBlock block = getMemoryBlock(refAddr);
-            if (refInstr == null || !refInstr.getFlowType().isCall() || block == null || !block.isExecute()) {
-                continue;
+            Address callSite = ref.getFromAddress();
+            Function callerFunc = getFunctionContaining(callSite);
+            if (callerFunc == null) continue;
+
+            // Strategy: Signature the [Call Instruction] + [Next Few Instructions]
+            List<Instruction> context = new ArrayList<>();
+            Instruction insn = getInstructionAt(callSite); 
+            
+            if (insn == null) continue;
+            context.add(insn);
+            
+            Instruction next = insn.getNext();
+            for(int k=0; k<XREF_CONTEXT_INSTRUCTIONS && next != null; k++) {
+                 context.add(next);
+                 next = next.getNext();
             }
 
-            // Create a signature starting from the CALL instruction itself, then include instructions after it
-            List<Instruction> xrefInstructions = new LinkedList<>();
-            Instruction current = refInstr; // start at the CALL
-            for (int i = 0; i < XREF_SIG_INSTRUCTIONS && current != null; i++) {
-                xrefInstructions.add(current);
-                current = current.getNext();
-            }
+            // Tokenize STRICT
+            List<String> tokens = tokenizeInstructions(context, MaskProfile.STRICT);
             
-            String signature = buildFeatureString(xrefInstructions);
-            if (isSignatureUniqueInBinary(signature)) {
-                String finalOutput = String.format("Signature: \"%s\" (Found via XRef from %s)", signature, refAddr);
-                copyToClipboard(signature);
-                println("Found unique XRef signature!");
-                println(finalOutput + " - This signature points directly to the call site.");
-                return;
+            StringBuilder sb = new StringBuilder();
+            for(String t : tokens) sb.append(t).append(" ");
+            String fullSig = sb.toString().trim();
+            
+            if (isSignatureUnique(fullSig)) {
+                return new SigResult(fullSig, callSite, 0, 80);
             }
         }
-        printerr("Failed to find any unique signature for this function, even via XRefs.");
+        return null;
+    }
+
+
+    // ============================================================================================
+    //  UTILITIES
+    // ============================================================================================
+
+    private boolean isSignatureUnique(String sigStr) {
+        try {
+            ByteSignature sig = new ByteSignature(sigStr);
+            Memory mem = currentProgram.getMemory();
+            
+            // Find first match
+            Address firstMatch = mem.findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
+            if (firstMatch == null) return false; 
+            
+            // Find second match (starting 1 byte after first)
+            Address secondMatch = mem.findBytes(firstMatch.add(1), currentProgram.getMaxAddress(), sig.bytes, sig.mask, true, monitor);
+            
+            return secondMatch == null;
+        } catch (Exception e) {
+            return false;
+        }
     }
     
-    /**
-     * Converts a list of instructions into a single signature string.
-     */
-    private String buildFeatureString(List<Instruction> instructions) throws MemoryAccessException {
-        List<String> tokens = new LinkedList<>();
-        for (Instruction instruction : instructions) {
-            tokens.addAll(instructionToTokens(instruction));
+    private List<Instruction> getInstructions(AddressSetView body, int max) {
+        List<Instruction> list = new ArrayList<>();
+        InstructionIterator it = currentProgram.getListing().getInstructions(body, true);
+        int count = 0;
+        while (it.hasNext() && count < max) {
+            list.add(it.next());
+            count++;
         }
-        return String.join(" ", tokens);
+        return list;
     }
 
-    /**
-     * Converts a single instruction into a list of byte tokens.
-     */
-    private List<String> instructionToTokens(Instruction insn) throws MemoryAccessException {
-        byte[] bytes = insn.getBytes();
-        String[] tok = new String[bytes.length];
-        for (int i = 0; i < bytes.length; i++) tok[i] = String.format("%02X", bytes[i]);
-
-        // 1) control flow, keep opcode, mask only relative offsets when applicable
-        if (insn.getFlowType().isCall()) {
-            // near rel32: E8 xx xx xx xx
-            if (bytes.length == 5 && (bytes[0] & 0xFF) == 0xE8) {
-                for (int i = 1; i < 5; i++) tok[i] = "?";
-                return Arrays.asList(tok);
-            }
-            // other calls, often indirect, remain volatile
-            Arrays.fill(tok, "?");
-            return Arrays.asList(tok);
-        }
-        // x86 loop family and jecxz, keep opcode and mask rel8
-        if (bytes.length == 2) {
-            int b0 = bytes[0] & 0xFF;
-            if (b0 == 0xE0 || b0 == 0xE1 || b0 == 0xE2 || b0 == 0xE3) { // LOOPNE, LOOPE, LOOP, JECXZ
-                tok[1] = "?";
-                return Arrays.asList(tok);
-            }
-        }
-        if (insn.getFlowType().isJump()) {
-            // short jmp: EB rel8
-            if (bytes.length == 2 && (bytes[0] & 0xFF) == 0xEB) {
-                tok[1] = "?";
-                return Arrays.asList(tok);
-            }
-            // near jmp: E9 rel32
-            if (bytes.length == 5 && (bytes[0] & 0xFF) == 0xE9) {
-                for (int i = 1; i < 5; i++) tok[i] = "?";
-                return Arrays.asList(tok);
-            }
-            Arrays.fill(tok, "?");
-            return Arrays.asList(tok);
-        }
-        if (insn.getFlowType().isConditional()) {
-            // short Jcc: 7x rel8
-            if (bytes.length == 2 && (bytes[0] & 0xF0) == 0x70) {
-                tok[1] = "?";
-                return Arrays.asList(tok);
-            }
-            // near Jcc: 0F 8x rel32 (standard encoding is exactly 6 bytes: 0F 8x + 4-byte offset)
-            if (bytes.length == 6 && (bytes[0] & 0xFF) == 0x0F && (bytes[1] & 0xF0) == 0x80) {
-                for (int i = 2; i < 6; i++) tok[i] = "?";
-                return Arrays.asList(tok);
-            }
-            Arrays.fill(tok, "?");
-            return Arrays.asList(tok);
-        }
-        // returns remain fully masked
-        if (insn.getFlowType().isTerminal()) {
-            Arrays.fill(tok, "?");
-            return Arrays.asList(tok);
-        }
-
-        // 2) mask bytes covered by relocations in this instruction
-        RelocationTable rt = currentProgram.getRelocationTable();
-        Address insnStart = insn.getAddress();
-        Address insnEnd = insnStart.add(bytes.length - 1);
-        Iterator<Relocation> it = rt.getRelocations(new AddressSet(insnStart, insnEnd));
-        int defaultPointerSize = currentProgram.getDefaultPointerSize();
-        while (it.hasNext()) {
-            Relocation rel = it.next();
-            Address ra = rel.getAddress();
-            int off = (int) ra.subtract(insnStart);
-            int len;
-            try {
-                len = rel.getLength();
-            } catch (Throwable t) {
-                printerr("Failed to get relocation length at " + ra + ": " + t);
-                len = defaultPointerSize;
-            }
-            if (len <= 0) len = Math.min(defaultPointerSize, Math.max(0, tok.length - off));
-            for (int i = 0; i < len && off + i < tok.length; i++) tok[off + i] = "?";
-        }
-
-        // 3) mask trailing immediate scalars
-        for (int op = 0; op < insn.getNumOperands(); op++) {
-            if ((insn.getOperandType(op) & ghidra.program.model.lang.OperandType.SCALAR) != 0) {
-                for (Object o : insn.getOpObjects(op)) {
-                    if (o instanceof Scalar) {
-                        int bits = ((Scalar) o).bitLength();
-                        int n = Math.max(1, (bits + 7) / 8);
-                        for (int i = 0; i < n && i < tok.length; i++) tok[tok.length - 1 - i] = "?";
-                    }
-                }
-            }
-        }
-
-        // 4) mask RIP or EIP relative disp32 on memory refs
-        boolean ripOrEipSeen = false, hasMemRef = false;
-        for (int op = 0; op < insn.getNumOperands(); op++) {
-            for (Object o : insn.getOpObjects(op)) {
-                if (o instanceof Register) {
-                    String rn = ((Register) o).getName().toUpperCase();
-                    if (rn.equals("RIP") || rn.equals("EIP")) ripOrEipSeen = true;
-                }
-            }
-            if (insn.getOperandReferences(op).length > 0) hasMemRef = true;
-        }
-        if (ripOrEipSeen && hasMemRef && tok.length >= 4) {
-            for (int i = 0; i < 4; i++) tok[tok.length - 1 - i] = "?";
-        }
-
-        // 5) mask stack frame displacements like [rsp+imm] or [rbp+imm], mask only the disp bytes
-        for (int op = 0; op < insn.getNumOperands(); op++) {
-            Object[] objs = insn.getOpObjects(op);
-
-            boolean hasSpBp = false;
-            int dispBytes = 0;        // 0 means no displacement detected
-            boolean memOperand = false;
-
-            for (Object o : objs) {
-                if (o instanceof Register) {
-                    String rn = ((Register) o).getName().toUpperCase();
-                    if (rn.equals("RSP") || rn.equals("ESP") || rn.equals("RBP") || rn.equals("EBP")) {
-                        hasSpBp = true;
-                    }
-                } else if (o instanceof Scalar) {
-                    int bits = ((Scalar) o).bitLength();
-                    if (bits <= 8) dispBytes = Math.max(dispBytes, 1);
-                    else if (bits <= 32) dispBytes = Math.max(dispBytes, 4);
-                }
-            }
-
-            // treat as memory if operand has refs, or is typed as ADDRESS
-            int optype = insn.getOperandType(op);
-            if (insn.getOperandReferences(op).length > 0 || (optype & OperandType.ADDRESS) != 0) {
-                memOperand = true;
-            }
-
-            if (hasSpBp && memOperand) {
-                if (dispBytes == 0) dispBytes = 1;  // typical [rsp+imm8] uses an 8-bit disp, keep opcode/ModRM/SIB
-                for (int i = 0; i < dispBytes && i < tok.length; i++) {
-                    tok[tok.length - 1 - i] = "?";  // mask only trailing disp bytes
-                }
-            }
-        }
-
-        // 6) extra safety for LEA, mask only the displacement at the end of the encoding
-        if ("LEA".equalsIgnoreCase(insn.getMnemonicString())) {
-            int dispBytes = 0;
-            for (int op = 0; op < insn.getNumOperands(); op++) {
-                for (Object o : insn.getOpObjects(op)) {
-                    if (o instanceof Scalar) {
-                        int bits = ((Scalar) o).bitLength();
-                        if (bits <= 8) dispBytes = Math.max(dispBytes, 1);
-                        else if (bits <= 32) dispBytes = Math.max(dispBytes, 4);
-                    }
-                }
-            }
-            if (dispBytes == 0) dispBytes = 1; // common LEA [rsp+imm8]
-            for (int i = 0; i < dispBytes && i < tok.length; i++) {
-                tok[tok.length - 1 - i] = "?"; // mask only trailing disp bytes
-            }
-        }
-
-        return Arrays.asList(tok);
-    }
-
-    /**
-     * Scans the entire program memory to check if a signature is unique.
-     *
-     * @param signature The signature to test.
-     * @return True if exactly one match is found.
-     */
-    private boolean isSignatureUniqueInBinary(String signature) throws CancelledException {
-        if (signature == null || signature.isEmpty()) return false;
-        ByteSignature sig = new ByteSignature(signature);
-        Memory mem = currentProgram.getMemory();
-        int hits = 0;
-
-        for (MemoryBlock block : mem.getBlocks()) {
-            if (!block.isExecute()) continue;
-            Address start = block.getStart();
-            Address end = block.getEnd();
-            Address cur = start;
-
-            while (true) {
-                monitor.checkCancelled();
-                Address hit = mem.findBytes(cur, sig.getBytes(), sig.getMask(), true, monitor);
-                if (hit == null || hit.compareTo(end) > 0) break;
-                hits++;
-                if (hits > 1) return false;
-                Address next = hit.add(1);
-                if (next.compareTo(end) > 0) break;
-                cur = next;
-            }
-        }
-        return hits == 1;
-    }
-
-    /**
-     * Prompts the user for a signature and finds its location in memory.
-     */
-    private void findSignature() {
-        try {
-            String signature = askString("Find Signature", "Enter signature:");
-            ByteSignature sig = new ByteSignature(signature);
-
-            Memory mem = currentProgram.getMemory();
-            for (MemoryBlock block : mem.getBlocks()) {
-                if (!block.isExecute()) continue;
-
-                Address start = block.getStart();
-                Address end = block.getEnd();
-                Address cur = start;
-
-                while (true) {
-                    monitor.checkCancelled();
-                    Address hit = mem.findBytes(cur, sig.getBytes(), sig.getMask(), true, monitor);
-                    if (hit == null || hit.compareTo(end) > 0) break;
-
-                    println("Signature found at: " + hit);
-                    goTo(hit);
-                    return; // stop at first executable match
-                }
-            }
-
-            println("Signature not found in executable blocks.");
-        } catch (Exception e) {
-            printerr("Error: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Copies a string to the system clipboard.
-     *
-     * @param text The text to copy.
-     */
     private void copyToClipboard(String text) {
         try {
-            Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-            clipboard.setContents(new StringSelection(text), null);
+            Clipboard c = Toolkit.getDefaultToolkit().getSystemClipboard();
+            c.setContents(new StringSelection(text), null);
         } catch (Exception e) {
-            printerr("Warning: Could not copy to clipboard. " + e.getMessage());
+            println("Clipboard copy failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Helper to parse IDA style "A1 ?? BB" strings
+     */
+    private static class ByteSignature {
+        public byte[] bytes;
+        public byte[] mask;
+
+        public ByteSignature(String s) {
+            s = s.trim().replaceAll("\\s+", " ");
+            String[] parts = s.split(" ");
+            bytes = new byte[parts.length];
+            mask = new byte[parts.length];
+            for (int i = 0; i < parts.length; i++) {
+                if (parts[i].contains("?")) {
+                    bytes[i] = 0;
+                    mask[i] = 0;
+                } else {
+                    bytes[i] = (byte) Integer.parseInt(parts[i], 16);
+                    mask[i] = (byte) 0xFF;
+                }
+            }
         }
     }
 }
