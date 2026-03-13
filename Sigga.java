@@ -1,7 +1,7 @@
 //A robust, patch-resistant signature generator for Ghidra.
 //Combines sliding-window algorithms, XRef detection, and aggressive smart-masking.
 //Automatically retries with lower strictness if a unique signature cannot be found.
-//@author lexika, Krixx1337, outercloudstudio
+//@author lexika, Krixx1337, outercloudstudio, Bello
 //@category Functions
 //@keybinding
 //@menupath
@@ -24,20 +24,26 @@ import ghidra.program.model.scalar.Scalar;
 import ghidra.program.model.symbol.Reference;
 import ghidra.util.exception.CancelledException;
 
+import java.awt.BorderLayout;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Frame;
+import java.awt.GridLayout;
 import java.awt.Toolkit;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.util.*;
+import javax.swing.*;
 
 public class Sigga extends GhidraScript {
 
-    // --- CONFIGURATION ---
-    private static final int MAX_INSTRUCTIONS_TO_SCAN = 200;
-    private static final int MIN_WINDOW_BYTES = 5;    // Minimum length of a sig
-    private static final int MAX_WINDOW_BYTES = 128;  // Maximum length of a sig; capped to avoid endless scans
-    private static final int HEAD_CHECK_SPAN = 3;     // First N bytes to check for stability
-    private static final int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
-    private static final int MAX_START_OFFSET = 64;   // Only start sigs within first 64 bytes of function
+    // --- CONFIGURATION (defaults, overridable via dialog) ---
+    private int MAX_INSTRUCTIONS_TO_SCAN = 200;
+    private int MIN_WINDOW_BYTES = 5;       // Minimum length of a sig
+    private int MAX_WINDOW_BYTES = 128;     // Maximum length of a sig
+    private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
+    private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
+    private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
 
     /**
      * Enum to control how aggressive the masking logic is.
@@ -45,6 +51,14 @@ public class Sigga extends GhidraScript {
     private enum MaskProfile {
         STRICT,    // Mask anything that looks like an address, offset, or variable (Best for patches)
         MINIMAL    // Only mask relocations and direct branches (Desperation mode)
+    }
+
+    /**
+     * Enum to select where signature generation starts.
+     */
+    private enum StartMode {
+        FUNCTION_START, // Begin at the function's entry point (most stable)
+        CURRENT_ADDRESS // Begin at the cursor's current location
     }
 
     /**
@@ -86,23 +100,165 @@ public class Sigga extends GhidraScript {
             return;
         }
 
-        Function func = getFunctionContaining(currentLocation.getAddress());
+        Address cursorAddr = currentLocation.getAddress();
+        Function func = getFunctionContaining(cursorAddr);
         if (func == null) {
             printerr("Sigga: Cursor is not inside a function.");
             return;
         }
 
-        println("Sigga: Analyzing " + func.getName() + " @ " + func.getEntryPoint());
-        
+        StartMode mode = showSettingsDialog(func, cursorAddr);
+        if (mode == null) {
+            println("Sigga: Cancelled by user.");
+            return;
+        }
+
+        Address startAddr = (mode == StartMode.CURRENT_ADDRESS) ? cursorAddr : func.getEntryPoint();
+        println("Sigga: Analyzing " + func.getName() + " @ " + startAddr + " (" + mode + ")");
+
         try {
-            generateSignatureRoutine(func);
+            generateSignatureRoutine(func, startAddr);
         } catch (CancelledException e) {
             println("Sigga: Generation cancelled by user.");
         }
     }
 
-    private void generateSignatureRoutine(Function func) throws Exception {
-        List<Instruction> instructions = getInstructions(func.getBody(), MAX_INSTRUCTIONS_TO_SCAN);
+    // Returns the selected StartMode, or null if cancelled.
+    private StartMode showSettingsDialog(Function func, Address cursorAddr) throws Exception {
+        StartMode[] selectedMode = new StartMode[] { StartMode.FUNCTION_START };
+        boolean[] confirmed = new boolean[] { false };
+
+        Runnable dialogTask = () -> {
+            JDialog dialog = new JDialog((Frame) null, "Sigga - Settings", true);
+            dialog.setLayout(new BorderLayout(10, 10));
+            dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+            // --- Info panel ---
+            JPanel infoPanel = new JPanel(new GridLayout(2, 1, 4, 4));
+            infoPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 0, 10));
+            infoPanel.add(new JLabel("Function: " + func.getName()));
+            infoPanel.add(new JLabel("Entry: " + func.getEntryPoint() + "  |  Cursor: " + cursorAddr));
+            dialog.add(infoPanel, BorderLayout.NORTH);
+
+            // --- Start mode panel ---
+            JPanel modePanel = new JPanel(new GridLayout(3, 1, 4, 4));
+            modePanel.setBorder(BorderFactory.createTitledBorder("Pattern Start Address"));
+            modePanel.add(new JLabel("Choose where the signature pattern begins scanning from:"));
+
+            JRadioButton fromFuncStart = new JRadioButton("From function start (" + func.getEntryPoint() + ")", true);
+            JRadioButton fromCursor = new JRadioButton("From current address (" + cursorAddr + ")");
+            ButtonGroup group = new ButtonGroup();
+            group.add(fromFuncStart);
+            group.add(fromCursor);
+            modePanel.add(fromFuncStart);
+            modePanel.add(fromCursor);
+
+            // --- Configuration mode selector ---
+            JPanel configModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+            configModePanel.add(new JLabel("Scan profile:  "));
+            JRadioButton cfgDefault = new JRadioButton("Default", true);
+            JRadioButton cfgCustom = new JRadioButton("Custom");
+            ButtonGroup cfgGroup = new ButtonGroup();
+            cfgGroup.add(cfgDefault);
+            cfgGroup.add(cfgCustom);
+            configModePanel.add(cfgDefault);
+            configModePanel.add(cfgCustom);
+
+            // --- Configuration panel (hidden by default) ---
+            JPanel configPanel = new JPanel(new GridLayout(6, 2, 6, 4));
+            configPanel.setBorder(BorderFactory.createTitledBorder("Configuration"));
+            configPanel.setVisible(false);
+
+            JSpinner spMaxInstr = new JSpinner(new SpinnerNumberModel(MAX_INSTRUCTIONS_TO_SCAN, 1, 10000, 10));
+            JSpinner spMinWindow = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_BYTES, 1, 256, 1));
+            JSpinner spMaxWindow = new JSpinner(new SpinnerNumberModel(MAX_WINDOW_BYTES, 1, 1024, 8));
+            JSpinner spHeadSpan = new JSpinner(new SpinnerNumberModel(HEAD_CHECK_SPAN, 1, 32, 1));
+            JSpinner spXrefCtx = new JSpinner(new SpinnerNumberModel(XREF_CONTEXT_INSTRUCTIONS, 1, 64, 1));
+            JSpinner spMaxOffset = new JSpinner(new SpinnerNumberModel(MAX_START_OFFSET, 1, 4096, 8));
+
+            configPanel.add(new JLabel("Max instructions to scan:"));
+            configPanel.add(spMaxInstr);
+            configPanel.add(new JLabel("Min signature length (bytes):"));
+            configPanel.add(spMinWindow);
+            configPanel.add(new JLabel("Max signature length (bytes):"));
+            configPanel.add(spMaxWindow);
+            configPanel.add(new JLabel("Head check span (bytes):"));
+            configPanel.add(spHeadSpan);
+            configPanel.add(new JLabel("XRef context instructions:"));
+            configPanel.add(spXrefCtx);
+            configPanel.add(new JLabel("Max start offset (bytes):"));
+            configPanel.add(spMaxOffset);
+
+            cfgCustom.addActionListener(e -> { configPanel.setVisible(true); dialog.pack(); });
+            cfgDefault.addActionListener(e -> { configPanel.setVisible(false); dialog.pack(); });
+
+            // --- Center: combine mode + config ---
+            JPanel centerPanel = new JPanel(new BorderLayout(0, 6));
+            centerPanel.setBorder(BorderFactory.createEmptyBorder(0, 10, 0, 10));
+            centerPanel.add(modePanel, BorderLayout.NORTH);
+            JPanel configWrapper = new JPanel(new BorderLayout(0, 4));
+            configWrapper.add(configModePanel, BorderLayout.NORTH);
+            configWrapper.add(configPanel, BorderLayout.CENTER);
+            centerPanel.add(configWrapper, BorderLayout.CENTER);
+            dialog.add(centerPanel, BorderLayout.CENTER);
+
+            // --- Buttons panel ---
+            JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+            JButton okBtn = new JButton("Generate");
+            JButton cancelBtn = new JButton("Cancel");
+            okBtn.addActionListener(e -> {
+                selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
+                if (cfgCustom.isSelected()) {
+                    int minW = (int) spMinWindow.getValue();
+                    int maxW = (int) spMaxWindow.getValue();
+                    if (minW > maxW) {
+                        JOptionPane.showMessageDialog(dialog,
+                            "Min signature length (" + minW + ") cannot exceed max (" + maxW + ").",
+                            "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
+                        return;
+                    }
+                    MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
+                    MIN_WINDOW_BYTES = minW;
+                    MAX_WINDOW_BYTES = maxW;
+                    HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
+                    XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
+                    MAX_START_OFFSET = (int) spMaxOffset.getValue();
+                }
+                confirmed[0] = true;
+                dialog.dispose();
+            });
+            cancelBtn.addActionListener(e -> dialog.dispose());
+            buttonPanel.add(okBtn);
+            buttonPanel.add(cancelBtn);
+            dialog.add(buttonPanel, BorderLayout.SOUTH);
+
+            dialog.getRootPane().setDefaultButton(okBtn);
+            dialog.pack();
+            dialog.setMinimumSize(new Dimension(420, 400));
+            dialog.setLocationRelativeTo(null);
+            dialog.setVisible(true);
+        };
+
+        if (SwingUtilities.isEventDispatchThread()) {
+            dialogTask.run();
+        } else {
+            SwingUtilities.invokeAndWait(dialogTask);
+        }
+
+        return confirmed[0] ? selectedMode[0] : null;
+    }
+
+    private void generateSignatureRoutine(Function func, Address startAddr) throws Exception {
+        // Snap to the containing instruction boundary so offsets and sigs stay aligned!
+        // This also ensures that if the user selects "Current Address" but happens to be in the middle of an instruction, we still generate a valid signature!.
+        Instruction startInsn = getInstructionContaining(startAddr);
+        if (startInsn == null) {
+            printerr("Sigga: No instruction found at " + startAddr);
+            return;
+        }
+        startAddr = startInsn.getMinAddress();
+
+        List<Instruction> instructions = getInstructionsFrom(func.getBody(), startAddr, MAX_INSTRUCTIONS_TO_SCAN);
         
         // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
         // We scan once with strict tokens. If we find a unique sig, we check its head.
@@ -111,7 +267,7 @@ public class Sigga extends GhidraScript {
         TokenData data = tokenizeInstructions(instructions, MaskProfile.STRICT);
         // Tier 1: Strict masking with a solid head (first byte must be concrete, offsets masked).
         // Tier 2: Same tokens but allows a weak head if uniqueness requires it.
-        SigResult directResult = findCheapestSignature(data, func.getEntryPoint());
+        SigResult directResult = findCheapestSignature(data, startAddr);
         
         if (directResult != null) {
             finish(directResult);
@@ -133,7 +289,7 @@ public class Sigga extends GhidraScript {
         // --- TIER 4: DESPERATION ---
         monitor.setMessage("Checking Tier 4 (Minimal)...");
         TokenData looseData = tokenizeInstructions(instructions, MaskProfile.MINIMAL);
-        SigResult looseResult = findCheapestSignature(looseData, func.getEntryPoint());
+        SigResult looseResult = findCheapestSignature(looseData, startAddr);
         
         if (looseResult != null) {
             looseResult.tier = "Tier 4 (Low Stability / Desperation)";
@@ -490,12 +646,14 @@ public class Sigga extends GhidraScript {
         }
     }
     
-    private List<Instruction> getInstructions(AddressSetView body, int max) {
+    private List<Instruction> getInstructionsFrom(AddressSetView body, Address startAddr, int max) {
         List<Instruction> list = new ArrayList<>();
-        InstructionIterator it = currentProgram.getListing().getInstructions(body, true);
+        InstructionIterator it = currentProgram.getListing().getInstructions(startAddr, true);
         int count = 0;
         while (it.hasNext() && count < max) {
-            list.add(it.next());
+            Instruction insn = it.next();
+            if (!body.contains(insn.getMinAddress())) break;
+            list.add(insn);
             count++;
         }
         return list;
