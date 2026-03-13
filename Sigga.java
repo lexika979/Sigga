@@ -141,8 +141,9 @@ public class Sigga extends GhidraScript {
             dialog.add(infoPanel, BorderLayout.NORTH);
 
             // --- Start mode panel ---
-            JPanel modePanel = new JPanel(new GridLayout(2, 1, 4, 4));
+            JPanel modePanel = new JPanel(new GridLayout(3, 1, 4, 4));
             modePanel.setBorder(BorderFactory.createTitledBorder("Pattern Start Address"));
+            modePanel.add(new JLabel("Choose where the signature pattern begins scanning from:"));
 
             JRadioButton fromFuncStart = new JRadioButton("From function start (" + func.getEntryPoint() + ")", true);
             JRadioButton fromCursor = new JRadioButton("From current address (" + cursorAddr + ")");
@@ -152,9 +153,21 @@ public class Sigga extends GhidraScript {
             modePanel.add(fromFuncStart);
             modePanel.add(fromCursor);
 
-            // --- Configuration panel ---
+            // --- Configuration mode selector ---
+            JPanel configModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+            configModePanel.add(new JLabel("Scan profile:  "));
+            JRadioButton cfgDefault = new JRadioButton("Default", true);
+            JRadioButton cfgCustom = new JRadioButton("Custom");
+            ButtonGroup cfgGroup = new ButtonGroup();
+            cfgGroup.add(cfgDefault);
+            cfgGroup.add(cfgCustom);
+            configModePanel.add(cfgDefault);
+            configModePanel.add(cfgCustom);
+
+            // --- Configuration panel (hidden by default) ---
             JPanel configPanel = new JPanel(new GridLayout(6, 2, 6, 4));
             configPanel.setBorder(BorderFactory.createTitledBorder("Configuration"));
+            configPanel.setVisible(false);
 
             JSpinner spMaxInstr = new JSpinner(new SpinnerNumberModel(MAX_INSTRUCTIONS_TO_SCAN, 1, 10000, 10));
             JSpinner spMinWindow = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_BYTES, 1, 256, 1));
@@ -176,11 +189,17 @@ public class Sigga extends GhidraScript {
             configPanel.add(new JLabel("Max start offset (bytes):"));
             configPanel.add(spMaxOffset);
 
+            cfgCustom.addActionListener(e -> { configPanel.setVisible(true); dialog.pack(); });
+            cfgDefault.addActionListener(e -> { configPanel.setVisible(false); dialog.pack(); });
+
             // --- Center: combine mode + config ---
             JPanel centerPanel = new JPanel(new BorderLayout(0, 6));
             centerPanel.setBorder(BorderFactory.createEmptyBorder(0, 10, 0, 10));
             centerPanel.add(modePanel, BorderLayout.NORTH);
-            centerPanel.add(configPanel, BorderLayout.CENTER);
+            JPanel configWrapper = new JPanel(new BorderLayout(0, 4));
+            configWrapper.add(configModePanel, BorderLayout.NORTH);
+            configWrapper.add(configPanel, BorderLayout.CENTER);
+            centerPanel.add(configWrapper, BorderLayout.CENTER);
             dialog.add(centerPanel, BorderLayout.CENTER);
 
             // --- Buttons panel ---
@@ -189,12 +208,22 @@ public class Sigga extends GhidraScript {
             JButton cancelBtn = new JButton("Cancel");
             okBtn.addActionListener(e -> {
                 selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
-                MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
-                MIN_WINDOW_BYTES = (int) spMinWindow.getValue();
-                MAX_WINDOW_BYTES = (int) spMaxWindow.getValue();
-                HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
-                XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
-                MAX_START_OFFSET = (int) spMaxOffset.getValue();
+                if (cfgCustom.isSelected()) {
+                    int minW = (int) spMinWindow.getValue();
+                    int maxW = (int) spMaxWindow.getValue();
+                    if (minW > maxW) {
+                        JOptionPane.showMessageDialog(dialog,
+                            "Min signature length (" + minW + ") cannot exceed max (" + maxW + ").",
+                            "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
+                        return;
+                    }
+                    MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
+                    MIN_WINDOW_BYTES = minW;
+                    MAX_WINDOW_BYTES = maxW;
+                    HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
+                    XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
+                    MAX_START_OFFSET = (int) spMaxOffset.getValue();
+                }
                 confirmed[0] = true;
                 dialog.dispose();
             });
@@ -220,6 +249,15 @@ public class Sigga extends GhidraScript {
     }
 
     private void generateSignatureRoutine(Function func, Address startAddr) throws Exception {
+        // Snap to the containing instruction boundary so offsets and sigs stay aligned!
+        // This also ensures that if the user selects "Current Address" but happens to be in the middle of an instruction, we still generate a valid signature!.
+        Instruction startInsn = getInstructionContaining(startAddr);
+        if (startInsn == null) {
+            printerr("Sigga: No instruction found at " + startAddr);
+            return;
+        }
+        startAddr = startInsn.getMinAddress();
+
         List<Instruction> instructions = getInstructionsFrom(func.getBody(), startAddr, MAX_INSTRUCTIONS_TO_SCAN);
         
         // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
@@ -608,23 +646,13 @@ public class Sigga extends GhidraScript {
         }
     }
     
-    /**
-     * Get instructions from the function body starting at startAddr.
-     */
     private List<Instruction> getInstructionsFrom(AddressSetView body, Address startAddr, int max) {
         List<Instruction> list = new ArrayList<>();
-        InstructionIterator it = currentProgram.getListing().getInstructions(body, true);
-        boolean reached = false;
+        InstructionIterator it = currentProgram.getListing().getInstructions(startAddr, true);
         int count = 0;
         while (it.hasNext() && count < max) {
             Instruction insn = it.next();
-            if (!reached) {
-                if (insn.getMinAddress().compareTo(startAddr) >= 0) {
-                    reached = true;
-                } else {
-                    continue;
-                }
-            }
+            if (!body.contains(insn.getMinAddress())) break;
             list.add(insn);
             count++;
         }
