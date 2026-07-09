@@ -449,7 +449,7 @@ public class Sigga extends GhidraScript {
             maskBranches(insn, tokens);
 
             if (profile == MaskProfile.STRICT) {
-                // 4. Aggressively mask operands that reference data/external symbols
+                // 4. Aggressively mask operands that reference mapped code/data or external symbols
                 maskOperandsSmart(insn, tokens);
             }
 
@@ -515,7 +515,7 @@ public class Sigga extends GhidraScript {
 
     /**
      * The "Paranoid" masking logic.
-     * Identifies operands that point to data/external symbols and masks their byte representation.
+     * Identifies operands that point to mapped memory or external symbols and masks their byte representation.
      */
     private void maskOperandsSmart(Instruction insn, String[] tokens) {
         byte[] bytes;
@@ -549,7 +549,7 @@ public class Sigga extends GhidraScript {
             }
 
             if (shouldMask) {
-                // If we found a data ref, we need to mask the bytes in the instruction that define it.
+                // If we found a volatile ref, mask the bytes in the instruction that define it.
                 // 1. RIP-relative search – locate displacement bytes that encode the data target
                 for (Reference ref : refs) {
                     Address toAddr = ref.getToAddress();
