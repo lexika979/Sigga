@@ -6,7 +6,7 @@ Sigga is a robust Ghidra script to create function signatures. It is well docume
 ## Features
 This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
-- **One-Click Generation:** Runs immediately without configuration dialogs.
+- **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
 - **Fast & Efficient:** A modern sliding-window algorithm with **instruction alignment enforcement** ensures signatures are generated instantly, even for large or generic functions.
 - **Signature by Cross-Reference (XRef) Fallback:** If a function's code is too generic to be unique (like a compiler-generated `memcpy`), Sigga will automatically create a signature for the code that *calls* it. This allows it to succeed where many other sigmakers fail.
@@ -30,14 +30,14 @@ To get the latest version with all performance fixes, download **Sigga.java** di
 
 ## Sigga in action
 
-Select any function (or place your cursor inside one) and press your assigned keybind. 
+Select any function (or place your cursor inside one) and press your assigned keybind.
 
-Sigga will immediately analyze the function, find the best possible signature (checking Direct, XRef, and Fallback tiers), and **automatically copy it to your clipboard**.
+Sigga will ask where the pattern should start, then analyze the function, find the best possible signature (checking Direct, XRef, and Fallback tiers), and **automatically copy it to your clipboard**.
 
 Results are printed to the **Ghidra Console**:
 
 ```text
-Sigga: Analyzing FUN_00975aa0 @ 00975aa0
+Sigga: Analyzing FUN_00975aa0 @ 00975aa0 (FUNCTION_START)
 ==================================================
  SIGGA SUCCESS - Tier 1 (High Stability, Direct)
 ==================================================

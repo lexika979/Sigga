@@ -44,6 +44,8 @@ public class Sigga extends GhidraScript {
     private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
     private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
     private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
+    private boolean ALLOW_XREF_FALLBACK = true;
+    private final Map<String, Boolean> uniquenessCache = new HashMap<>();
 
     /**
      * Enum to control how aggressive the masking logic is.
@@ -140,9 +142,9 @@ public class Sigga extends GhidraScript {
             infoPanel.add(new JLabel("Entry: " + func.getEntryPoint() + "  |  Cursor: " + cursorAddr));
             dialog.add(infoPanel, BorderLayout.NORTH);
 
-            // --- Start mode panel ---
-            JPanel modePanel = new JPanel(new GridLayout(3, 1, 4, 4));
-            modePanel.setBorder(BorderFactory.createTitledBorder("Pattern Start Address"));
+            // --- Generation options panel ---
+            JPanel modePanel = new JPanel(new GridLayout(4, 1, 4, 4));
+            modePanel.setBorder(BorderFactory.createTitledBorder("Generation Options"));
             modePanel.add(new JLabel("Choose where the signature pattern begins scanning from:"));
 
             JRadioButton fromFuncStart = new JRadioButton("From function start (" + func.getEntryPoint() + ")", true);
@@ -152,6 +154,9 @@ public class Sigga extends GhidraScript {
             group.add(fromCursor);
             modePanel.add(fromFuncStart);
             modePanel.add(fromCursor);
+            JCheckBox allowXref = new JCheckBox("Allow XRef fallback", ALLOW_XREF_FALLBACK);
+            allowXref.setToolTipText("If enabled, Sigga may generate a caller/reference-site signature when direct signatures fail.");
+            modePanel.add(allowXref);
 
             // --- Configuration mode selector ---
             JPanel configModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -208,6 +213,7 @@ public class Sigga extends GhidraScript {
             JButton cancelBtn = new JButton("Cancel");
             okBtn.addActionListener(e -> {
                 selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
+                ALLOW_XREF_FALLBACK = allowXref.isSelected();
                 if (cfgCustom.isSelected()) {
                     int minW = (int) spMinWindow.getValue();
                     int maxW = (int) spMaxWindow.getValue();
@@ -249,6 +255,8 @@ public class Sigga extends GhidraScript {
     }
 
     private void generateSignatureRoutine(Function func, Address startAddr) throws Exception {
+        uniquenessCache.clear();
+
         // Snap to the containing instruction boundary so offsets and sigs stay aligned!
         // This also ensures that if the user selects "Current Address" but happens to be in the middle of an instruction, we still generate a valid signature!.
         Instruction startInsn = getInstructionContaining(startAddr);
@@ -277,14 +285,18 @@ public class Sigga extends GhidraScript {
         println("... Direct scan failed. Function is likely generic/duplicate.");
 
         // --- TIER 3: XREF SCAN ---
-        monitor.setMessage("Checking Tier 3 (XRefs)...");
-        SigResult xrefResult = tryXRefSignature(func);
-        if (xrefResult != null) {
-            finish(xrefResult);
-            return;
-        }
+        if (ALLOW_XREF_FALLBACK) {
+            monitor.setMessage("Checking Tier 3 (XRefs)...");
+            SigResult xrefResult = tryXRefSignature(func);
+            if (xrefResult != null) {
+                finish(xrefResult);
+                return;
+            }
 
-        println("... Tier 3 failed (No unique XRefs found).");
+            println("... Tier 3 failed (No unique XRefs found).");
+        } else {
+            println("... Tier 3 skipped (XRef fallback disabled).");
+        }
 
         // --- TIER 4: DESPERATION ---
         monitor.setMessage("Checking Tier 4 (Minimal)...");
@@ -293,6 +305,7 @@ public class Sigga extends GhidraScript {
         
         if (looseResult != null) {
             looseResult.tier = "Tier 4 (Low Stability / Desperation)";
+            looseResult.quality = 60;
             finish(looseResult);
             return;
         }
@@ -446,7 +459,7 @@ public class Sigga extends GhidraScript {
             maskBranches(insn, tokens);
 
             if (profile == MaskProfile.STRICT) {
-                // 4. Aggressively mask operands that reference data/external symbols
+                // 4. Aggressively mask operands that reference mapped code/data or external symbols
                 maskOperandsSmart(insn, tokens);
             }
 
@@ -467,12 +480,16 @@ public class Sigga extends GhidraScript {
         while (rels.hasNext()) {
             Relocation r = rels.next();
             int offset = (int) r.getAddress().subtract(start);
-            // Default mask length 4
-            int len = 4;
+            int len = getRelocationMaskLength(r);
             for (int i = 0; i < len && (offset + i) < tokens.length; i++) {
                 tokens[offset + i] = "?";
             }
         }
+    }
+
+    private int getRelocationMaskLength(Relocation r) {
+        int len = r.getLength();
+        return len > 0 ? len : 4;
     }
 
     private void maskBranches(Instruction insn, String[] tokens) {
@@ -485,8 +502,8 @@ public class Sigga extends GhidraScript {
             if (b0 == 0xE8 || b0 == 0xE9) {
                 for (int i = 1; i < tokens.length; i++) tokens[i] = "?";
             }
-            // Short jumps (EB / 7x) – mask the displacement byte
-            else if (tokens.length == 2 && (b0 == 0xEB || (b0 & 0xF0) == 0x70)) {
+            // Short jumps (EB / 7x / E3) – mask the displacement byte
+            else if (tokens.length == 2 && (b0 == 0xEB || b0 == 0xE3 || (b0 & 0xF0) == 0x70)) {
                  tokens[1] = "?";
             }
             // Long conditional (0F 8x) – mask displacement dword
@@ -496,12 +513,19 @@ public class Sigga extends GhidraScript {
                     for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
                 }
             }
+            // x64 RIP-relative indirect CALL/JMP: FF 15 disp32 / FF 25 disp32
+            else if (tokens.length >= 6 && b0 == 0xFF && !tokens[1].contains("?")) {
+                int b1 = Integer.parseInt(tokens[1], 16);
+                if (b1 == 0x15 || b1 == 0x25) {
+                    maskRange(tokens, 2, 4);
+                }
+            }
         }
     }
 
     /**
      * The "Paranoid" masking logic.
-     * Identifies operands that point to data/external symbols and masks their byte representation.
+     * Identifies operands that point to mapped memory or external symbols and masks their byte representation.
      */
     private void maskOperandsSmart(Instruction insn, String[] tokens) {
         byte[] bytes;
@@ -517,7 +541,7 @@ public class Sigga extends GhidraScript {
                 if (toAddr == null) continue;
                 if (toAddr.isExternalAddress()) { shouldMask = true; break; }
                 MemoryBlock block = getMemoryBlock(toAddr);
-                if (block != null && !block.isExecute()) { shouldMask = true; break; }
+                if (block != null) { shouldMask = true; break; }
             }
 
             if (!shouldMask) {
@@ -526,18 +550,16 @@ public class Sigga extends GhidraScript {
                     if (obj instanceof Scalar) {
                         Scalar s = (Scalar) obj;
                         long val = s.getUnsignedValue();
-                        // Ignore small immediates (likely loop counters or offsets < 64KB)
-                        if (val > 0x10000) {
-                            Address possibleAddr = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(val);
-                            MemoryBlock block = getMemoryBlock(possibleAddr);
-                            if (block != null && !block.isExecute()) shouldMask = true;
-                        }
+                        Address possibleAddr = getDefaultAddress(val);
+                        if (possibleAddr == null) continue;
+                        MemoryBlock block = getMemoryBlock(possibleAddr);
+                        if (block != null) shouldMask = true;
                     }
                 }
             }
 
             if (shouldMask) {
-                // If we found a data ref, we need to mask the bytes in the instruction that define it.
+                // If we found a volatile ref, mask the bytes in the instruction that define it.
                 // 1. RIP-relative search – locate displacement bytes that encode the data target
                 for (Reference ref : refs) {
                     Address toAddr = ref.getToAddress();
@@ -567,7 +589,7 @@ public class Sigga extends GhidraScript {
      */
     private void maskValueInBytes(String[] tokens, byte[] bytes, long value, int size) {
         if (size > 8 || bytes.length < size) return;
-        for (int i = 0; i <= bytes.length - size; i++) {
+        for (int i = bytes.length - size; i >= 0; i--) {
             long currentVal = 0;
             // Read bytes as little endian
             for (int k = 0; k < size; k++) currentVal |= ((long)(bytes[i+k] & 0xFF)) << (k*8);
@@ -578,8 +600,15 @@ public class Sigga extends GhidraScript {
             else { if (currentVal == value) match = true; }
 
             if (match) {
-                for (int k=0; k<size; k++) tokens[i+k] = "?";
+                maskRange(tokens, i, size);
+                break;
             }
+        }
+    }
+
+    private void maskRange(String[] tokens, int start, int len) {
+        for (int i = 0; i < len && (start + i) < tokens.length; i++) {
+            tokens[start + i] = "?";
         }
     }
 
@@ -592,7 +621,9 @@ public class Sigga extends GhidraScript {
         Reference[] refs = getReferencesTo(funcStart);
         
         for (Reference ref : refs) {
-            if (!ref.getReferenceType().isCall()) continue;
+            if (!ref.getReferenceType().isCall() &&
+                !ref.getReferenceType().isJump() &&
+                !ref.getReferenceType().isData()) continue;
             
             Address callSite = ref.getFromAddress();
             Function callerFunc = getFunctionContaining(callSite);
@@ -605,6 +636,7 @@ public class Sigga extends GhidraScript {
             // Strategy: Signature the call instruction plus the next few instructions for unique context.
             Instruction next = insn.getNext();
             for(int k=0; k<XREF_CONTEXT_INSTRUCTIONS && next != null; k++) {
+                 if (!callerFunc.getBody().contains(next.getMinAddress())) break;
                  context.add(next);
                  next = next.getNext();
             }
@@ -627,23 +659,56 @@ public class Sigga extends GhidraScript {
     // ============================================================================================
 
     private boolean isSignatureUnique(String sigStr) throws CancelledException {
+        Boolean cached = uniquenessCache.get(sigStr);
+        if (cached != null) return cached;
+
         try {
             monitor.checkCancelled();
             ByteSignature sig = new ByteSignature(sigStr);
-            Memory mem = currentProgram.getMemory();
-            
-            // Find first match
-            Address firstMatch = mem.findBytes(currentProgram.getMinAddress(), sig.bytes, sig.mask, true, monitor);
-            if (firstMatch == null) return false; 
+            Address firstMatch = findInExecutableMemory(sig, null);
+            if (firstMatch == null) {
+                uniquenessCache.put(sigStr, false);
+                return false;
+            }
             
             // Find second match (starting 1 byte after first)
-            Address secondMatch = mem.findBytes(firstMatch.add(1), currentProgram.getMaxAddress(), sig.bytes, sig.mask, true, monitor);
-            return secondMatch == null;
+            Address secondMatch = findInExecutableMemory(sig, firstMatch.add(1));
+            boolean unique = secondMatch == null;
+            uniquenessCache.put(sigStr, unique);
+            return unique;
         } catch (CancelledException e) {
             throw e;
         } catch (Exception e) {
+            uniquenessCache.put(sigStr, false);
             return false;
         }
+    }
+
+    private Address getDefaultAddress(long offset) {
+        try {
+            return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(offset);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private Address findInExecutableMemory(ByteSignature sig, Address minAddr) throws CancelledException {
+        Memory mem = currentProgram.getMemory();
+        for (MemoryBlock block : mem.getBlocks()) {
+            monitor.checkCancelled();
+            if (!block.isExecute()) continue;
+
+            Address start = block.getStart();
+            Address end = block.getEnd();
+            if (minAddr != null) {
+                if (end.compareTo(minAddr) < 0) continue;
+                if (start.compareTo(minAddr) < 0) start = minAddr;
+            }
+
+            Address match = mem.findBytes(start, end, sig.bytes, sig.mask, true, monitor);
+            if (match != null) return match;
+        }
+        return null;
     }
     
     private List<Instruction> getInstructionsFrom(AddressSetView body, Address startAddr, int max) {
