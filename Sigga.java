@@ -296,6 +296,7 @@ public class Sigga extends GhidraScript {
         
         if (looseResult != null) {
             looseResult.tier = "Tier 4 (Low Stability / Desperation)";
+            looseResult.quality = 60;
             finish(looseResult);
             return;
         }
