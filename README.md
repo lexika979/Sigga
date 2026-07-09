@@ -6,7 +6,7 @@ Sigga is a robust Ghidra script to create function signatures. It is well docume
 ## Features
 This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
-- **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning and optionally tune scan limits.
+- **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
 - **Fast & Efficient:** A modern sliding-window algorithm with **instruction alignment enforcement** ensures signatures are generated instantly, even for large or generic functions.
 - **Signature by Cross-Reference (XRef) Fallback:** If a function's code is too generic to be unique (like a compiler-generated `memcpy`), Sigga will automatically create a signature for the code that *calls* it. This allows it to succeed where many other sigmakers fail.

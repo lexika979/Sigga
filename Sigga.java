@@ -44,6 +44,7 @@ public class Sigga extends GhidraScript {
     private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
     private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
     private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
+    private boolean ALLOW_XREF_FALLBACK = true;
     private final Map<String, Boolean> uniquenessCache = new HashMap<>();
 
     /**
@@ -141,9 +142,9 @@ public class Sigga extends GhidraScript {
             infoPanel.add(new JLabel("Entry: " + func.getEntryPoint() + "  |  Cursor: " + cursorAddr));
             dialog.add(infoPanel, BorderLayout.NORTH);
 
-            // --- Start mode panel ---
-            JPanel modePanel = new JPanel(new GridLayout(3, 1, 4, 4));
-            modePanel.setBorder(BorderFactory.createTitledBorder("Pattern Start Address"));
+            // --- Generation options panel ---
+            JPanel modePanel = new JPanel(new GridLayout(4, 1, 4, 4));
+            modePanel.setBorder(BorderFactory.createTitledBorder("Generation Options"));
             modePanel.add(new JLabel("Choose where the signature pattern begins scanning from:"));
 
             JRadioButton fromFuncStart = new JRadioButton("From function start (" + func.getEntryPoint() + ")", true);
@@ -153,6 +154,9 @@ public class Sigga extends GhidraScript {
             group.add(fromCursor);
             modePanel.add(fromFuncStart);
             modePanel.add(fromCursor);
+            JCheckBox allowXref = new JCheckBox("Allow XRef fallback", ALLOW_XREF_FALLBACK);
+            allowXref.setToolTipText("If enabled, Sigga may generate a caller/reference-site signature when direct signatures fail.");
+            modePanel.add(allowXref);
 
             // --- Configuration mode selector ---
             JPanel configModePanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
@@ -209,6 +213,7 @@ public class Sigga extends GhidraScript {
             JButton cancelBtn = new JButton("Cancel");
             okBtn.addActionListener(e -> {
                 selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
+                ALLOW_XREF_FALLBACK = allowXref.isSelected();
                 if (cfgCustom.isSelected()) {
                     int minW = (int) spMinWindow.getValue();
                     int maxW = (int) spMaxWindow.getValue();
@@ -280,14 +285,18 @@ public class Sigga extends GhidraScript {
         println("... Direct scan failed. Function is likely generic/duplicate.");
 
         // --- TIER 3: XREF SCAN ---
-        monitor.setMessage("Checking Tier 3 (XRefs)...");
-        SigResult xrefResult = tryXRefSignature(func);
-        if (xrefResult != null) {
-            finish(xrefResult);
-            return;
-        }
+        if (ALLOW_XREF_FALLBACK) {
+            monitor.setMessage("Checking Tier 3 (XRefs)...");
+            SigResult xrefResult = tryXRefSignature(func);
+            if (xrefResult != null) {
+                finish(xrefResult);
+                return;
+            }
 
-        println("... Tier 3 failed (No unique XRefs found).");
+            println("... Tier 3 failed (No unique XRefs found).");
+        } else {
+            println("... Tier 3 skipped (XRef fallback disabled).");
+        }
 
         // --- TIER 4: DESPERATION ---
         monitor.setMessage("Checking Tier 4 (Minimal)...");
