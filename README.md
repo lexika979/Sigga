@@ -1,17 +1,21 @@
 # Sigga - sigmaker for Ghidra
 *The name "Sigga" is a mix of the german word "Digga" (roughly translates to "brother"), and "Signature"*
 
-Sigga is a robust Ghidra script to create function signatures. It is well documented and easily maintainable.
+Sigga is a Ghidra script for creating x86/x64 function signatures. It is well documented and easily maintainable.
 
 ## Features
 This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
 - **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
+- **Shared x86/x64 Defaults:** Uses an 8-96 byte window, four-byte head check, and at least six concrete bytes without architecture-specific profiles.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
-- **Fast & Efficient:** A modern sliding-window algorithm with **instruction alignment enforcement** ensures signatures are generated instantly, even for large or generic functions.
-- **Signature by Cross-Reference (XRef) Fallback:** If a function's code is too generic to be unique (like a compiler-generated `memcpy`), Sigga will automatically create a signature for the code that *calls* it. This allows it to succeed where many other sigmakers fail.
-- **Intelligent Stability Analysis:** The logic for what to wildcard is highly advanced, including static data references (`[RIP + disp]`) to create far more robust signatures that are more likely to survive game updates.
+- **Practical Search:** Instruction-aligned candidates are ranked by emitted length after wildcard trimming, concrete-byte density, then offset. Search scope is executable memory only, using cached concrete anchors with a bounded verification cap before masked fallback.
+- **Ranked XRef Fallback:** If direct code is too generic, Sigga keeps a bounded queue of the 512 best distinct resolver-safe windows, evaluates them shortest-first, and stops at the first unique result.
+- **Resolvable References:** Supports relative `CALL`/`JMP` forms with 8-, 16-, or 32-bit displacements where valid, plus x64 RIP-relative `LEA`, and prints candidate-relative resolver metadata.
+- **x86/x64-aware Masking:** Masks common relative branches, relocations, RIP-relative operands, and absolute mapped references. Ghidra operand masks identify value-byte fields; ambiguous fallback matches remain concrete.
 - **Professional Offset Signatures:** The script produces industry-standard signatures with offsets, avoiding problematic leading wildcards.
+
+Sigga measures uniqueness in executable memory of the opened program. Its confidence score is heuristic; validate generated patterns against a later build before relying on patch resistance.
 
 ## Installation
 To get the latest version with all performance fixes, download **Sigga.java** directly from the source:
@@ -39,12 +43,12 @@ Results are printed to the **Ghidra Console**:
 ```text
 Sigga: Analyzing FUN_00975aa0 @ 00975aa0 (FUNCTION_START)
 ==================================================
- SIGGA SUCCESS - Tier 1 (High Stability, Direct)
+ SIGGA SUCCESS - Tier 1 (Direct / Strong Head)
 ==================================================
 Signature:  48 83 EC 28 48 8B 05 ? ? ? ? 48 85 C0
 Address:    00975aa0
 Offset:     +0
-Quality:    100/100
+Heuristic confidence: 100/100
 ==================================================
 >> Copied to clipboard.
 ```
@@ -60,6 +64,11 @@ Feel free to open a pull request, but please make sure your changes/new code are
 - **[@Krixx1337](https://github.com/Krixx1337)** - Major architectural overhaul, adding the XRef fallback, sliding window search, and advanced stability analysis.
 - **outercloudstudio** - Fixed a bug with the original wildcard placement.
 
-## Known bugs/Issues
+## Limits
 
-- None.
+- Supports 32-bit and 64-bit x86 programs only.
+- Generates single-build heuristics, not a cross-version compatibility guarantee.
+- Tier 3 signatures require applying printed resolver metadata to recover the referenced function.
+- XRef candidates obey configured minimum and maximum emitted signature lengths.
+- Every emitted tier requires the configured minimum number of concrete bytes (six by default).
+- Far and ambiguous indirect XRefs are intentionally excluded.

@@ -1,4 +1,4 @@
-//A robust, patch-resistant signature generator for Ghidra.
+//A robust x86/x64 signature generator for Ghidra.
 //Combines sliding-window algorithms, XRef detection, and aggressive smart-masking.
 //Automatically retries with lower strictness if a unique signature cannot be found.
 //@author lexika, Krixx1337, outercloudstudio, Bello
@@ -11,7 +11,9 @@ import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.address.AddressSetView;
-import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.Mask;
+import ghidra.program.model.lang.OperandType;
+import ghidra.program.model.lang.Processor;
 import ghidra.program.model.listing.Function;
 import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.InstructionIterator;
@@ -38,14 +40,30 @@ import javax.swing.*;
 public class Sigga extends GhidraScript {
 
     // --- CONFIGURATION (defaults, overridable via dialog) ---
-    private int MAX_INSTRUCTIONS_TO_SCAN = 200;
-    private int MIN_WINDOW_BYTES = 5;       // Minimum length of a sig
-    private int MAX_WINDOW_BYTES = 128;     // Maximum length of a sig
-    private int HEAD_CHECK_SPAN = 3;        // First N bytes to check for stability
-    private int XREF_CONTEXT_INSTRUCTIONS = 8; // How many instructions to grab for XRef sigs
-    private int MAX_START_OFFSET = 64;      // Only start sigs within first N bytes of function
+    private static final int DEFAULT_MAX_INSTRUCTIONS_TO_SCAN = 200;
+    private static final int DEFAULT_MIN_WINDOW_BYTES = 8;
+    private static final int DEFAULT_MAX_WINDOW_BYTES = 96;
+    private static final int DEFAULT_MIN_CONCRETE_BYTES = 6;
+    private static final int DEFAULT_HEAD_CHECK_SPAN = 4;
+    private static final int DEFAULT_XREF_CONTEXT_INSTRUCTIONS = 8;
+    private static final int DEFAULT_MAX_START_OFFSET = 64;
+    private static final int MIN_CONCRETE_ANCHOR_BYTES = 4;
+    private static final int MAX_ANCHOR_MATCHES_TO_VERIFY = 32;
+    private static final int MAX_ANCHOR_CACHE_ENTRIES = 1024;
+    private static final int MAX_XREF_CANDIDATES = 512;
+    private static final int MAX_X86_INSTRUCTION_BYTES = 15;
+
+    private int MAX_INSTRUCTIONS_TO_SCAN = DEFAULT_MAX_INSTRUCTIONS_TO_SCAN;
+    private int MIN_WINDOW_BYTES = DEFAULT_MIN_WINDOW_BYTES;
+    private int MAX_WINDOW_BYTES = DEFAULT_MAX_WINDOW_BYTES;
+    private int MIN_CONCRETE_BYTES = DEFAULT_MIN_CONCRETE_BYTES;
+    private int HEAD_CHECK_SPAN = DEFAULT_HEAD_CHECK_SPAN;
+    private int XREF_CONTEXT_INSTRUCTIONS = DEFAULT_XREF_CONTEXT_INSTRUCTIONS;
+    private int MAX_START_OFFSET = DEFAULT_MAX_START_OFFSET;
     private boolean ALLOW_XREF_FALLBACK = true;
     private final Map<String, Boolean> uniquenessCache = new HashMap<>();
+    private final Map<String, ByteSignature> parsedSignatureCache = new HashMap<>();
+    private final Map<String, AnchorMatches> anchorMatchesCache = new HashMap<>();
 
     /**
      * Enum to control how aggressive the masking logic is.
@@ -70,15 +88,59 @@ public class Sigga extends GhidraScript {
         String signature;
         Address address;
         long offset; // Offset from start of function/block
-        int quality; // 100 = Best, 0 = Worst
+        int quality; // Heuristic confidence only; not a patch-survival guarantee.
         String tier;
+        String resolver;
 
         public SigResult(String signature, Address address, long offset, int quality, String tier) {
+            this(signature, address, offset, quality, tier, null);
+        }
+
+        public SigResult(String signature, Address address, long offset, int quality, String tier,
+                         String resolver) {
             this.signature = signature;
             this.address = address;
             this.offset = offset;
             this.quality = quality;
             this.tier = tier;
+            this.resolver = resolver;
+        }
+    }
+
+    private static class XRefResolver {
+        String kind;
+        int instructionOffset;
+        int displacementOffset;
+        int displacementSize;
+        int instructionLength;
+
+        XRefResolver(String kind, int displacementOffset, int displacementSize, int instructionLength) {
+            this.kind = kind;
+            this.displacementOffset = displacementOffset;
+            this.displacementSize = displacementSize;
+            this.instructionLength = instructionLength;
+        }
+    }
+
+    private static class XRefCandidate {
+        SigResult result;
+        boolean weakHead;
+        Address referenceAddress;
+
+        XRefCandidate(SigResult result, boolean weakHead, Address referenceAddress) {
+            this.result = result;
+            this.weakHead = weakHead;
+            this.referenceAddress = referenceAddress;
+        }
+    }
+
+    private static class AnchorMatches {
+        List<Address> addresses;
+        boolean complete;
+
+        AnchorMatches(List<Address> addresses, boolean complete) {
+            this.addresses = addresses;
+            this.complete = complete;
         }
     }
 
@@ -97,8 +159,18 @@ public class Sigga extends GhidraScript {
 
     @Override
     public void run() throws Exception {
+        if (currentProgram == null) {
+            printerr("Sigga: No program is open.");
+            return;
+        }
+
         if (currentLocation == null) {
             printerr("Sigga: No cursor location found. Please run this script from the Listing window.");
+            return;
+        }
+
+        if (!isSupportedX86Program()) {
+            printerr("Sigga: Only 32-bit x86 and 64-bit x86 programs are supported.");
             return;
         }
 
@@ -170,13 +242,14 @@ public class Sigga extends GhidraScript {
             configModePanel.add(cfgCustom);
 
             // --- Configuration panel (hidden by default) ---
-            JPanel configPanel = new JPanel(new GridLayout(6, 2, 6, 4));
+            JPanel configPanel = new JPanel(new GridLayout(7, 2, 6, 4));
             configPanel.setBorder(BorderFactory.createTitledBorder("Configuration"));
             configPanel.setVisible(false);
 
             JSpinner spMaxInstr = new JSpinner(new SpinnerNumberModel(MAX_INSTRUCTIONS_TO_SCAN, 1, 10000, 10));
             JSpinner spMinWindow = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_BYTES, 1, 256, 1));
             JSpinner spMaxWindow = new JSpinner(new SpinnerNumberModel(MAX_WINDOW_BYTES, 1, 1024, 8));
+            JSpinner spMinConcrete = new JSpinner(new SpinnerNumberModel(MIN_CONCRETE_BYTES, 1, 256, 1));
             JSpinner spHeadSpan = new JSpinner(new SpinnerNumberModel(HEAD_CHECK_SPAN, 1, 32, 1));
             JSpinner spXrefCtx = new JSpinner(new SpinnerNumberModel(XREF_CONTEXT_INSTRUCTIONS, 1, 64, 1));
             JSpinner spMaxOffset = new JSpinner(new SpinnerNumberModel(MAX_START_OFFSET, 1, 4096, 8));
@@ -187,6 +260,8 @@ public class Sigga extends GhidraScript {
             configPanel.add(spMinWindow);
             configPanel.add(new JLabel("Max signature length (bytes):"));
             configPanel.add(spMaxWindow);
+            configPanel.add(new JLabel("Min concrete bytes:"));
+            configPanel.add(spMinConcrete);
             configPanel.add(new JLabel("Head check span (bytes):"));
             configPanel.add(spHeadSpan);
             configPanel.add(new JLabel("XRef context instructions:"));
@@ -195,7 +270,18 @@ public class Sigga extends GhidraScript {
             configPanel.add(spMaxOffset);
 
             cfgCustom.addActionListener(e -> { configPanel.setVisible(true); dialog.pack(); });
-            cfgDefault.addActionListener(e -> { configPanel.setVisible(false); dialog.pack(); });
+            cfgDefault.addActionListener(e -> {
+                resetConfigurationDefaults();
+                spMaxInstr.setValue(MAX_INSTRUCTIONS_TO_SCAN);
+                spMinWindow.setValue(MIN_WINDOW_BYTES);
+                spMaxWindow.setValue(MAX_WINDOW_BYTES);
+                spMinConcrete.setValue(MIN_CONCRETE_BYTES);
+                spHeadSpan.setValue(HEAD_CHECK_SPAN);
+                spXrefCtx.setValue(XREF_CONTEXT_INSTRUCTIONS);
+                spMaxOffset.setValue(MAX_START_OFFSET);
+                configPanel.setVisible(false);
+                dialog.pack();
+            });
 
             // --- Center: combine mode + config ---
             JPanel centerPanel = new JPanel(new BorderLayout(0, 6));
@@ -214,18 +300,28 @@ public class Sigga extends GhidraScript {
             okBtn.addActionListener(e -> {
                 selectedMode[0] = fromCursor.isSelected() ? StartMode.CURRENT_ADDRESS : StartMode.FUNCTION_START;
                 ALLOW_XREF_FALLBACK = allowXref.isSelected();
-                if (cfgCustom.isSelected()) {
+                if (cfgDefault.isSelected()) {
+                    resetConfigurationDefaults();
+                } else {
                     int minW = (int) spMinWindow.getValue();
                     int maxW = (int) spMaxWindow.getValue();
+                    int minConcrete = (int) spMinConcrete.getValue();
                     if (minW > maxW) {
                         JOptionPane.showMessageDialog(dialog,
                             "Min signature length (" + minW + ") cannot exceed max (" + maxW + ").",
                             "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
                         return;
                     }
+                    if (minConcrete > maxW) {
+                        JOptionPane.showMessageDialog(dialog,
+                            "Min concrete bytes (" + minConcrete + ") cannot exceed max signature length (" + maxW + ").",
+                            "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
+                        return;
+                    }
                     MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
                     MIN_WINDOW_BYTES = minW;
                     MAX_WINDOW_BYTES = maxW;
+                    MIN_CONCRETE_BYTES = minConcrete;
                     HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
                     XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
                     MAX_START_OFFSET = (int) spMaxOffset.getValue();
@@ -256,6 +352,8 @@ public class Sigga extends GhidraScript {
 
     private void generateSignatureRoutine(Function func, Address startAddr) throws Exception {
         uniquenessCache.clear();
+        parsedSignatureCache.clear();
+        anchorMatchesCache.clear();
 
         // Snap to the containing instruction boundary so offsets and sigs stay aligned!
         // This also ensures that if the user selects "Current Address" but happens to be in the middle of an instruction, we still generate a valid signature!.
@@ -268,13 +366,9 @@ public class Sigga extends GhidraScript {
 
         List<Instruction> instructions = getInstructionsFrom(func.getBody(), startAddr, MAX_INSTRUCTIONS_TO_SCAN);
         
-        // --- TIER 1 & 2: DIRECT SCAN (Optimized One-Pass) ---
-        // We scan once with strict tokens. If we find a unique sig, we check its head.
-        // If head is solid -> Tier 1. If head is weak -> Tier 2.
+        // --- TIER 1 & 2: DIRECT SCAN ---
         monitor.setMessage("Scanning for Direct Signature...");
         TokenData data = tokenizeInstructions(instructions, MaskProfile.STRICT);
-        // Tier 1: Strict masking with a solid head (first byte must be concrete, offsets masked).
-        // Tier 2: Same tokens but allows a weak head if uniqueness requires it.
         SigResult directResult = findCheapestSignature(data, startAddr);
         
         if (directResult != null) {
@@ -304,8 +398,8 @@ public class Sigga extends GhidraScript {
         SigResult looseResult = findCheapestSignature(looseData, startAddr);
         
         if (looseResult != null) {
-            looseResult.tier = "Tier 4 (Low Stability / Desperation)";
-            looseResult.quality = 60;
+            looseResult.tier = "Tier 4 (Low Confidence / Desperation)";
+            looseResult.quality = Math.min(looseResult.quality, 60);
             finish(looseResult);
             return;
         }
@@ -322,7 +416,10 @@ public class Sigga extends GhidraScript {
         println("Signature:  " + result.signature);
         println("Address:    " + result.address);
         println("Offset:     +" + Long.toHexString(result.offset).toUpperCase());
-        println("Quality:    " + result.quality + "/100");
+        println("Heuristic confidence: " + result.quality + "/100");
+        if (result.resolver != null) {
+            println("Resolver:   " + result.resolver);
+        }
         println("==================================================");
 
         copyToClipboard(result.signature);
@@ -330,64 +427,95 @@ public class Sigga extends GhidraScript {
     }
 
     /**
-     * Sliding Window Algorithm (optimized):
-     * Finds the shortest unique substring of tokens by:
-     * 1. Only starting at instruction boundaries (and near the head of the function).
-     * 2. Only checking uniqueness at instruction boundaries to cut redundant checks.
-     * 3. Classifying Tier 1 vs Tier 2 automatically by inspecting the head bytes.
+     * Finds the best direct signature: shortest first, then denser concrete bytes, then lower offset.
      */
     private SigResult findCheapestSignature(TokenData data, Address startAddr) throws CancelledException {
         List<String> tokens = data.tokens;
         int n = tokens.size();
+        SigResult best = null;
 
-        // Iterate through possible start positions (i)
         for (int i = 0; i < n; i++) {
             monitor.checkCancelled();
 
-            // 1. Only start at instruction boundaries
             if (!data.instructionStartIndices.contains(i)) continue;
-            // 2. Limit start depth (don't scan deep into massive functions)
-            // Use >= to match the logic of "first X bytes" (0-indexed)
             if (i >= MAX_START_OFFSET) break;
+            // Runtime scanners commonly reject leading wildcards; do not emit them.
+            if (tokens.get(i).contains("?")) continue;
 
             StringBuilder sigBuilder = new StringBuilder();
             int byteCount = 0;
 
-            // Grow the window (j)
             for (int j = i; j < n; j++) {
                 String tok = tokens.get(j);
                 if (sigBuilder.length() > 0) sigBuilder.append(" ");
                 sigBuilder.append(tok);
                 byteCount++;
 
-                if (byteCount < MIN_WINDOW_BYTES) continue;
-                if (byteCount > MAX_WINDOW_BYTES) break;
-
-                // 3. OPTIMIZATION: Only check uniqueness if we represent a full instruction.
-                // We assume we are at the end of an instruction if (j+1) is the start of a new one,
-                // or if we have reached the total token count.
                 boolean isInstructionEnd = (j + 1 == n) || data.instructionStartIndices.contains(j + 1);
-                
-                if (!isInstructionEnd) {
-                    continue; 
+                if (!isInstructionEnd) continue;
+                if (byteCount < MIN_WINDOW_BYTES) continue;
+
+                String currentSig = sigBuilder.toString();
+                String finalSig = trimTrailingWildcards(currentSig);
+                int finalLength = countSignatureTokens(finalSig);
+                if (finalLength < MIN_WINDOW_BYTES) continue;
+                if (finalLength > MAX_WINDOW_BYTES) break;
+                if (countConcreteTokens(finalSig) < MIN_CONCRETE_BYTES) continue;
+
+                int bestLength = best == null ? Integer.MAX_VALUE : countSignatureTokens(best.signature);
+                if (finalLength > bestLength) break;
+
+                boolean weakHead = isHeadWeak(tokens, i);
+                String tier = weakHead ? "Tier 2 (Direct / Loose Head)" : "Tier 1 (Direct / Strong Head)";
+                if (isSignatureUnique(finalSig)) {
+                    SigResult candidate = new SigResult(finalSig, startAddr, i,
+                        calculateHeuristicConfidence(finalSig, weakHead), tier);
+                    if (isBetterDirectCandidate(candidate, best)) best = candidate;
                 }
 
-                // Check uniqueness
-                String currentSig = sigBuilder.toString();
-                if (isSignatureUnique(currentSig)) {
-                    // CLEANUP: Trim trailing wildcards if possible (e.g. "A B ? ?" -> "A B")
-                    String finalSig = trimTrailingWildcards(currentSig);
-                    
-                    // Found a unique sig. Classify it.
-                    boolean solidHead = !isHeadWeak(tokens, i);
-                    String tier = solidHead ? "Tier 1 (High Stability, Direct)" : "Tier 2 (High Stability, Loose Head)";
-                    int quality = solidHead ? 100 : 90;
-                    
-                    return new SigResult(finalSig, startAddr, i, quality, tier);
-                }
+                // Future trailing wildcards cannot change this emitted pattern. A future concrete
+                // byte can only make it longer, so it cannot beat an equal-or-shorter best.
+                bestLength = best == null ? Integer.MAX_VALUE : countSignatureTokens(best.signature);
+                if (finalLength >= bestLength) break;
+                if (byteCount > MAX_WINDOW_BYTES) break;
             }
         }
-        return null;
+        return best;
+    }
+
+    private boolean isBetterDirectCandidate(SigResult candidate, SigResult current) {
+        if (current == null) return true;
+
+        int candidateLength = countSignatureTokens(candidate.signature);
+        int currentLength = countSignatureTokens(current.signature);
+        if (candidateLength != currentLength) return candidateLength < currentLength;
+
+        int candidateConcrete = countConcreteTokens(candidate.signature);
+        int currentConcrete = countConcreteTokens(current.signature);
+        if (candidateConcrete != currentConcrete) return candidateConcrete > currentConcrete;
+
+        return candidate.offset < current.offset;
+    }
+
+    private int calculateHeuristicConfidence(String signature, boolean weakHead) {
+        int total = countSignatureTokens(signature);
+        if (total == 0) return 0;
+
+        int density = (countConcreteTokens(signature) * 100) / total;
+        int confidence = 60 + (density * 40) / 100;
+        return weakHead ? Math.max(50, confidence - 10) : confidence;
+    }
+
+    private int countSignatureTokens(String signature) {
+        return signature.isEmpty() ? 0 : signature.split(" ").length;
+    }
+
+    private int countConcreteTokens(String signature) {
+        int concrete = 0;
+        for (String token : signature.split(" ")) {
+            if (!token.contains("?")) concrete++;
+        }
+        return concrete;
     }
 
     private String trimTrailingWildcards(String sig) {
@@ -493,34 +621,50 @@ public class Sigga extends GhidraScript {
     }
 
     private void maskBranches(Instruction insn, String[] tokens) {
-        if (insn.getFlowType().isCall() || insn.getFlowType().isJump()) {
-            // Safety check: if byte 0 was already masked by relocation, don't parse it
-            if (tokens[0].contains("?")) return;
+        if (!insn.getFlowType().isCall() && !insn.getFlowType().isJump()) return;
 
-            int b0 = Integer.parseInt(tokens[0], 16);
-            // Heuristic: mask rel32 for CALL/JMP (E8/E9) to avoid volatile branch targets
-            if (b0 == 0xE8 || b0 == 0xE9) {
-                for (int i = 1; i < tokens.length; i++) tokens[i] = "?";
-            }
-            // Short jumps (EB / 7x / E3) – mask the displacement byte
-            else if (tokens.length == 2 && (b0 == 0xEB || b0 == 0xE3 || (b0 & 0xF0) == 0x70)) {
-                 tokens[1] = "?";
-            }
-            // Long conditional (0F 8x) – mask displacement dword
-            else if (tokens.length >= 6 && b0 == 0x0F) {
-                // Safety check for 0F 8x check
-                if (!tokens[1].contains("?") && (Integer.parseInt(tokens[1], 16) & 0xF0) == 0x80) {
-                    for (int i = 2; i < tokens.length; i++) tokens[i] = "?";
-                }
-            }
-            // x64 RIP-relative indirect CALL/JMP: FF 15 disp32 / FF 25 disp32
-            else if (tokens.length >= 6 && b0 == 0xFF && !tokens[1].contains("?")) {
-                int b1 = Integer.parseInt(tokens[1], 16);
-                if (b1 == 0x15 || b1 == 0x25) {
-                    maskRange(tokens, 2, 4);
-                }
+        byte[] bytes;
+        try { bytes = insn.getBytes(); } catch (Exception e) { return; }
+        int opcodeOffset = getX86OpcodeOffset(bytes);
+        if (opcodeOffset >= tokens.length || tokens[opcodeOffset].contains("?")) return;
+
+        int opcode = bytes[opcodeOffset] & 0xff;
+        if (opcode == 0xE8 || opcode == 0xE9) {
+            maskRange(tokens, opcodeOffset + 1, tokens.length - opcodeOffset - 1);
+        }
+        // rel8 branches: JMP, Jcc, LOOP*, and JCXZ/JECXZ/JRCXZ.
+        else if (opcodeOffset + 1 < tokens.length &&
+                 (opcode == 0xEB || (opcode & 0xF0) == 0x70 ||
+                  (opcode >= 0xE0 && opcode <= 0xE3))) {
+            maskRange(tokens, opcodeOffset + 1, 1);
+        }
+        // rel16/rel32 conditional branches.
+        else if (opcode == 0x0F && opcodeOffset + 1 < tokens.length &&
+                 (bytes[opcodeOffset + 1] & 0xF0) == 0x80) {
+            maskRange(tokens, opcodeOffset + 2, tokens.length - opcodeOffset - 2);
+        }
+        // x64 RIP-relative indirect CALL/JMP; x86 absolute-IAT form uses same displacement field.
+        else if (opcode == 0xFF && opcodeOffset + 5 < tokens.length) {
+            int modrm = bytes[opcodeOffset + 1] & 0xff;
+            if (modrm == 0x15 || modrm == 0x25) {
+                maskRange(tokens, opcodeOffset + 2, 4);
             }
         }
+    }
+
+    private int getX86OpcodeOffset(byte[] bytes) {
+        int index = 0;
+        while (index < bytes.length) {
+            int value = bytes[index] & 0xff;
+            boolean legacyPrefix = value == 0xF0 || value == 0xF2 || value == 0xF3 ||
+                value == 0x2E || value == 0x36 || value == 0x3E || value == 0x26 ||
+                value == 0x64 || value == 0x65 || value == 0x66 || value == 0x67;
+            boolean rexPrefix = currentProgram.getDefaultPointerSize() == 8 &&
+                value >= 0x40 && value <= 0x4F;
+            if (!legacyPrefix && !rexPrefix) break;
+            index++;
+        }
+        return index;
     }
 
     /**
@@ -544,7 +688,10 @@ public class Sigga extends GhidraScript {
                 if (block != null) { shouldMask = true; break; }
             }
 
-            if (!shouldMask) {
+            // Only infer an address from raw scalar values when the language marks this operand
+            // as address-like. This avoids treating ordinary constants such as MOV EDX, 8 as
+            // mapped pointers in binaries whose memory map starts near zero.
+            if (!shouldMask && OperandType.isAddress(insn.getOperandType(op))) {
                 Object[] opObjects = insn.getOpObjects(op);
                 for (Object obj : opObjects) {
                     if (obj instanceof Scalar) {
@@ -559,51 +706,110 @@ public class Sigga extends GhidraScript {
             }
 
             if (shouldMask) {
-                // If we found a volatile ref, mask the bytes in the instruction that define it.
-                // 1. RIP-relative search – locate displacement bytes that encode the data target
+                byte[] operandMask = getOperandValueMask(insn, op, bytes.length);
                 for (Reference ref : refs) {
                     Address toAddr = ref.getToAddress();
                     if (toAddr != null) {
                         long target = toAddr.getOffset();
                         long instrEnd = insn.getAddress().add(bytes.length).getOffset();
-                        long disp = target - instrEnd; 
-                        // Search for the displacement (4 bytes)
-                        maskValueInBytes(tokens, bytes, disp, 4);
+                        if (currentProgram.getDefaultPointerSize() == 8) {
+                            // x64 normally reaches mapped operands through RIP-relative disp32.
+                            if (!maskOperandEncoding(tokens, bytes, operandMask,
+                                    target - instrEnd, 4)) {
+                                if (!maskOperandEncoding(tokens, bytes, operandMask, target, 4)) {
+                                    maskOperandEncoding(tokens, bytes, operandMask, target, 8);
+                                }
+                            }
+                        } else {
+                            // x86 normally encodes mapped operands as absolute disp32.
+                            if (!maskOperandEncoding(tokens, bytes, operandMask, target, 4)) {
+                                maskOperandEncoding(tokens, bytes, operandMask,
+                                    target - instrEnd, 4);
+                            }
+                        }
                     }
                 }
-                // 2. Absolute scalar search – mask immediates that look like pointers
+
                 Object[] opObjects = insn.getOpObjects(op);
                 for (Object obj : opObjects) {
                     if (obj instanceof Scalar) {
                         long val = ((Scalar)obj).getUnsignedValue();
-                        maskValueInBytes(tokens, bytes, val, 4); 
-                        maskValueInBytes(tokens, bytes, val, 8); 
+                        maskOperandEncoding(tokens, bytes, operandMask, val, 4);
+                        if (currentProgram.getDefaultPointerSize() == 8) {
+                            maskOperandEncoding(tokens, bytes, operandMask, val, 8);
+                        }
                     }
                 }
             }
         }
     }
 
-    /**
-     * Helper to find a value (little endian) in the byte array and mask it.
-     */
-    private void maskValueInBytes(String[] tokens, byte[] bytes, long value, int size) {
-        if (size > 8 || bytes.length < size) return;
-        for (int i = bytes.length - size; i >= 0; i--) {
-            long currentVal = 0;
-            // Read bytes as little endian
-            for (int k = 0; k < size; k++) currentVal |= ((long)(bytes[i+k] & 0xFF)) << (k*8);
-            
-            // Mask if matches (handle 32-bit sign extension comparison)
-            boolean match = false;
-            if (size == 4) { if ((int)currentVal == (int)value) match = true; } 
-            else { if (currentVal == value) match = true; }
-
-            if (match) {
-                maskRange(tokens, i, size);
-                break;
-            }
+    private byte[] getOperandValueMask(Instruction insn, int operandIndex, int instructionLength) {
+        try {
+            Mask mask = insn.getPrototype().getOperandValueMask(operandIndex);
+            if (mask == null) return null;
+            byte[] maskBytes = mask.getBytes();
+            return maskBytes.length == instructionLength ? maskBytes : null;
+        } catch (Exception e) {
+            return null;
         }
+    }
+
+    /**
+     * Masks a value only where Ghidra says the selected operand stores full value bytes.
+     * If no compatible operand mask exists, use the conservative tail fallback below.
+     */
+    private boolean maskOperandEncoding(String[] tokens, byte[] bytes, byte[] operandMask,
+                                        long value, int size) {
+        if (operandMask == null) return maskValueNearOperandTail(tokens, bytes, value, size);
+        if (size > 8 || bytes.length < size) return false;
+
+        int matchStart = -1;
+        int matchCount = 0;
+        for (int i = 0; i <= bytes.length - size; i++) {
+            boolean fullValueBytes = true;
+            for (int k = 0; k < size; k++) {
+                if ((operandMask[i + k] & 0xff) != 0xff) {
+                    fullValueBytes = false;
+                    break;
+                }
+            }
+            if (!fullValueBytes || !matchesLittleEndianValue(bytes, i, value, size)) continue;
+            matchStart = i;
+            matchCount++;
+        }
+
+        if (matchCount != 1) return false;
+        maskRange(tokens, matchStart, size);
+        return true;
+    }
+
+    /**
+     * Masks a little-endian immediate/displacement only at the tail of an x86/x64 instruction.
+     * A displacement can precede a trailing imm8/imm32, so search at most four bytes before its end.
+     */
+    private boolean maskValueNearOperandTail(String[] tokens, byte[] bytes, long value, int size) {
+        if (size > 8 || bytes.length < size) return false;
+        int lastStart = bytes.length - size;
+        int firstStart = Math.max(0, lastStart - 4);
+        int matchStart = -1;
+        int matchCount = 0;
+        for (int i = lastStart; i >= firstStart; i--) {
+            if (!matchesLittleEndianValue(bytes, i, value, size)) continue;
+            matchStart = i;
+            matchCount++;
+        }
+        if (matchCount != 1) return false;
+        maskRange(tokens, matchStart, size);
+        return true;
+    }
+
+    private boolean matchesLittleEndianValue(byte[] bytes, int start, long value, int size) {
+        long currentValue = 0;
+        for (int k = 0; k < size; k++) {
+            currentValue |= ((long) (bytes[start + k] & 0xff)) << (k * 8);
+        }
+        return size == 4 ? (int) currentValue == (int) value : currentValue == value;
     }
 
     private void maskRange(String[] tokens, int start, int len) {
@@ -619,39 +825,224 @@ public class Sigga extends GhidraScript {
     private SigResult tryXRefSignature(Function targetFunc) throws Exception {
         Address funcStart = targetFunc.getEntryPoint();
         Reference[] refs = getReferencesTo(funcStart);
+        PriorityQueue<XRefCandidate> candidates = new PriorityQueue<>(
+            MAX_XREF_CANDIDATES, (a, b) -> compareXRefCandidates(b, a));
+        Map<String, XRefCandidate> candidatesBySignature = new HashMap<>();
         
         for (Reference ref : refs) {
-            if (!ref.getReferenceType().isCall() &&
-                !ref.getReferenceType().isJump() &&
-                !ref.getReferenceType().isData()) continue;
-            
-            Address callSite = ref.getFromAddress();
-            Function callerFunc = getFunctionContaining(callSite);
+            monitor.checkCancelled();
+            Instruction referenceInsn = getInstructionContaining(ref.getFromAddress());
+            if (referenceInsn == null) continue;
+
+            XRefResolver resolver = getSupportedXRefResolver(referenceInsn, ref);
+            if (resolver == null) continue;
+
+            Function callerFunc = getFunctionContaining(referenceInsn.getMinAddress());
             if (callerFunc == null) continue;
 
-            List<Instruction> context = new ArrayList<>();
-            Instruction insn = getInstructionAt(callSite); 
-            if (insn == null) continue;
-            context.add(insn);
-            // Strategy: Signature the call instruction plus the next few instructions for unique context.
-            Instruction next = insn.getNext();
-            for(int k=0; k<XREF_CONTEXT_INSTRUCTIONS && next != null; k++) {
-                 if (!callerFunc.getBody().contains(next.getMinAddress())) break;
-                 context.add(next);
-                 next = next.getNext();
-            }
+            List<Instruction> context = buildXRefContext(referenceInsn, callerFunc);
+            if (context.isEmpty()) continue;
 
-            TokenData data = tokenizeInstructions(context, MaskProfile.STRICT);
-            StringBuilder sb = new StringBuilder();
-            for(String t : data.tokens) sb.append(t).append(" ");
-            String fullSig = sb.toString().trim();
-            
-            if (isSignatureUnique(fullSig)) {
-                String finalSig = trimTrailingWildcards(fullSig);
-                return new SigResult(finalSig, callSite, 0, 80, "Tier 3 (XRef / Caller)");
+            int referenceIndex = indexOfInstruction(context, referenceInsn);
+            if (referenceIndex < 0) continue;
+
+            collectXRefCandidates(context, referenceIndex, resolver, ref.getFromAddress(),
+                candidates, candidatesBySignature);
+        }
+
+        List<XRefCandidate> rankedCandidates = new ArrayList<>(candidates);
+        rankedCandidates.sort(this::compareXRefCandidates);
+        for (XRefCandidate candidate : rankedCandidates) {
+            monitor.checkCancelled();
+            if (isSignatureUnique(candidate.result.signature)) return candidate.result;
+        }
+        return null;
+    }
+
+    private void collectXRefCandidates(List<Instruction> context, int referenceIndex,
+                                       XRefResolver resolver, Address referenceAddress,
+                                       PriorityQueue<XRefCandidate> candidates,
+                                       Map<String, XRefCandidate> candidatesBySignature)
+            throws Exception {
+        TokenData data = tokenizeInstructions(context, MaskProfile.STRICT);
+        int[] instructionOffsets = new int[context.size() + 1];
+        for (int i = 0; i < context.size(); i++) {
+            instructionOffsets[i + 1] = instructionOffsets[i] + context.get(i).getLength();
+        }
+
+        for (int startIndex = 0; startIndex <= referenceIndex; startIndex++) {
+            monitor.checkCancelled();
+            int startToken = instructionOffsets[startIndex];
+            if (data.tokens.get(startToken).contains("?")) continue;
+
+            for (int endIndex = referenceIndex; endIndex < context.size(); endIndex++) {
+                int endToken = instructionOffsets[endIndex + 1];
+                int rawLength = endToken - startToken;
+                if (rawLength < MIN_WINDOW_BYTES) continue;
+
+                String rawSignature = joinTokens(data.tokens, startToken, endToken);
+                String finalSignature = trimTrailingWildcards(rawSignature);
+                int finalLength = countSignatureTokens(finalSignature);
+                if (finalLength < MIN_WINDOW_BYTES) continue;
+                if (finalLength > MAX_WINDOW_BYTES) break;
+                if (countConcreteTokens(finalSignature) < MIN_CONCRETE_BYTES) continue;
+
+                if (candidates.size() >= MAX_XREF_CANDIDATES) {
+                    int worstLength = countSignatureTokens(candidates.peek().result.signature);
+                    if (finalLength > worstLength) break;
+                }
+
+                boolean weakHead = isHeadWeak(data.tokens, startToken);
+                XRefResolver adjustedResolver = copyXRefResolver(resolver);
+                adjustedResolver.instructionOffset = instructionOffsets[referenceIndex] - startToken;
+                SigResult result = new SigResult(finalSignature,
+                    context.get(startIndex).getMinAddress(), 0,
+                    calculateHeuristicConfidence(finalSignature, weakHead),
+                    "Tier 3 (XRef / " + adjustedResolver.kind + ")",
+                    formatXRefResolver(adjustedResolver));
+                offerXRefCandidate(new XRefCandidate(result, weakHead, referenceAddress),
+                    candidates, candidatesBySignature);
+
+                if (rawLength > MAX_WINDOW_BYTES) break;
+            }
+        }
+    }
+
+    private int compareXRefCandidates(XRefCandidate candidate, XRefCandidate current) {
+        int candidateLength = countSignatureTokens(candidate.result.signature);
+        int currentLength = countSignatureTokens(current.result.signature);
+        if (candidateLength != currentLength) return Integer.compare(candidateLength, currentLength);
+        if (candidate.weakHead != current.weakHead) return candidate.weakHead ? 1 : -1;
+
+        int candidateConcrete = countConcreteTokens(candidate.result.signature);
+        int currentConcrete = countConcreteTokens(current.result.signature);
+        if (candidateConcrete != currentConcrete) return Integer.compare(currentConcrete, candidateConcrete);
+
+        int referenceOrder = candidate.referenceAddress.compareTo(current.referenceAddress);
+        if (referenceOrder != 0) return referenceOrder;
+        return candidate.result.address.compareTo(current.result.address);
+    }
+
+    private void offerXRefCandidate(XRefCandidate candidate,
+                                    PriorityQueue<XRefCandidate> candidates,
+                                    Map<String, XRefCandidate> candidatesBySignature) {
+        XRefCandidate existing = candidatesBySignature.get(candidate.result.signature);
+        if (existing != null) {
+            if (compareXRefCandidates(candidate, existing) >= 0) return;
+            candidates.remove(existing);
+            candidatesBySignature.remove(existing.result.signature);
+        }
+
+        if (candidates.size() >= MAX_XREF_CANDIDATES) {
+            XRefCandidate worst = candidates.peek();
+            if (compareXRefCandidates(candidate, worst) >= 0) return;
+            candidates.poll();
+            candidatesBySignature.remove(worst.result.signature);
+        }
+
+        candidates.add(candidate);
+        candidatesBySignature.put(candidate.result.signature, candidate);
+    }
+
+    private String joinTokens(List<String> tokens, int start, int endExclusive) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = start; i < endExclusive; i++) {
+            if (builder.length() > 0) builder.append(' ');
+            builder.append(tokens.get(i));
+        }
+        return builder.toString();
+    }
+
+    private XRefResolver copyXRefResolver(XRefResolver resolver) {
+        return new XRefResolver(resolver.kind, resolver.displacementOffset,
+            resolver.displacementSize, resolver.instructionLength);
+    }
+
+    private XRefResolver getSupportedXRefResolver(Instruction insn, Reference ref) {
+        byte[] bytes;
+        try { bytes = insn.getBytes(); } catch (Exception e) { return null; }
+        int opcodeOffset = getX86OpcodeOffset(bytes);
+        if (opcodeOffset >= bytes.length) return null;
+
+        int opcode = bytes[opcodeOffset] & 0xff;
+        if (opcode == 0xE8 && ref.getReferenceType().isCall()) {
+            int displacementSize = bytes.length - opcodeOffset - 1;
+            if (displacementSize == 2 || displacementSize == 4) {
+                return new XRefResolver("rel" + (displacementSize * 8) + "-call",
+                    opcodeOffset + 1, displacementSize, bytes.length);
+            }
+        }
+        if (opcode == 0xE9 && ref.getReferenceType().isJump()) {
+            int displacementSize = bytes.length - opcodeOffset - 1;
+            if (displacementSize == 2 || displacementSize == 4) {
+                return new XRefResolver("rel" + (displacementSize * 8) + "-jmp",
+                    opcodeOffset + 1, displacementSize, bytes.length);
+            }
+        }
+        if (opcode == 0xEB && ref.getReferenceType().isJump() &&
+            bytes.length - opcodeOffset - 1 == 1) {
+            return new XRefResolver("rel8-jmp", opcodeOffset + 1, 1, bytes.length);
+        }
+        if (currentProgram.getDefaultPointerSize() == 8 && opcode == 0x8D &&
+            ref.getReferenceType().isData() && opcodeOffset + 6 <= bytes.length) {
+            int modrm = bytes[opcodeOffset + 1] & 0xff;
+            if ((modrm & 0xC7) == 0x05) {
+                return new XRefResolver("rip-rel-lea", opcodeOffset + 2, 4, bytes.length);
             }
         }
         return null;
+    }
+
+    private List<Instruction> buildXRefContext(Instruction referenceInsn, Function callerFunc) {
+        List<Instruction> context = new ArrayList<>();
+        context.add(referenceInsn);
+
+        Instruction current = referenceInsn;
+        int beforeBytes = referenceInsn.getLength();
+        for (int count = 0; count < XREF_CONTEXT_INSTRUCTIONS; count++) {
+            Instruction previous = currentProgram.getListing()
+                .getInstructionBefore(current.getMinAddress());
+            if (previous == null || !callerFunc.getBody().contains(previous.getMinAddress())) break;
+            Address fallThrough = previous.getFallThrough();
+            if (fallThrough == null || !fallThrough.equals(current.getMinAddress())) break;
+            if (beforeBytes + previous.getLength() >
+                MAX_WINDOW_BYTES + MAX_X86_INSTRUCTION_BYTES) break;
+            context.add(0, previous);
+            beforeBytes += previous.getLength();
+            current = previous;
+        }
+
+        current = referenceInsn;
+        int afterBytes = referenceInsn.getLength();
+        for (int count = 0; count < XREF_CONTEXT_INSTRUCTIONS; count++) {
+            if (!current.getFlowType().hasFallthrough()) break;
+            Instruction next = current.getNext();
+            Address fallThrough = current.getFallThrough();
+            if (next == null || fallThrough == null ||
+                !fallThrough.equals(next.getMinAddress()) ||
+                !callerFunc.getBody().contains(next.getMinAddress())) break;
+            if (afterBytes + next.getLength() >
+                MAX_WINDOW_BYTES + MAX_X86_INSTRUCTION_BYTES) break;
+            context.add(next);
+            afterBytes += next.getLength();
+            current = next;
+        }
+
+        return context;
+    }
+
+    private int indexOfInstruction(List<Instruction> context, Instruction target) {
+        for (int i = 0; i < context.size(); i++) {
+            if (context.get(i).getMinAddress().equals(target.getMinAddress())) return i;
+        }
+        return -1;
+    }
+
+    private String formatXRefResolver(XRefResolver resolver) {
+        int displacementAt = resolver.instructionOffset + resolver.displacementOffset;
+        int nextInstruction = resolver.instructionOffset + resolver.instructionLength;
+        return String.format("%s: target = match + 0x%X + signed read_i%d(match + 0x%X)",
+            resolver.kind, nextInstruction, resolver.displacementSize * 8, displacementAt);
     }
 
     // ============================================================================================
@@ -664,16 +1055,21 @@ public class Sigga extends GhidraScript {
 
         try {
             monitor.checkCancelled();
-            ByteSignature sig = new ByteSignature(sigStr);
-            Address firstMatch = findInExecutableMemory(sig, null);
-            if (firstMatch == null) {
-                uniquenessCache.put(sigStr, false);
-                return false;
+            ByteSignature sig = parsedSignatureCache.get(sigStr);
+            if (sig == null) {
+                sig = new ByteSignature(sigStr);
+                parsedSignatureCache.put(sigStr, sig);
             }
-            
-            // Find second match (starting 1 byte after first)
-            Address secondMatch = findInExecutableMemory(sig, firstMatch.add(1));
-            boolean unique = secondMatch == null;
+            ConcreteAnchor anchor = getLongestConcreteAnchor(sig);
+            if (anchor != null) {
+                Boolean anchorResult = determineUniquenessFromAnchor(sig, anchor);
+                if (anchorResult != null) {
+                    uniquenessCache.put(sigStr, anchorResult);
+                    return anchorResult;
+                }
+            }
+
+            boolean unique = determineUniquenessWithMaskedSearch(sig);
             uniquenessCache.put(sigStr, unique);
             return unique;
         } catch (CancelledException e) {
@@ -682,6 +1078,148 @@ public class Sigga extends GhidraScript {
             uniquenessCache.put(sigStr, false);
             return false;
         }
+    }
+
+    /**
+     * Enumerates exact anchor matches and verifies the full masked pattern at each derived start.
+     * Returns null after the safety cap so callers can fall back to native masked searching.
+     */
+    private Boolean determineUniquenessFromAnchor(ByteSignature sig, ConcreteAnchor anchor)
+            throws CancelledException {
+        AnchorMatches matches = getAnchorMatches(anchor.signature);
+        if (!matches.complete) return null;
+
+        int verifiedMatches = 0;
+        for (Address anchorMatch : matches.addresses) {
+            monitor.checkCancelled();
+            try {
+                Address candidateStart = anchorMatch.subtract(anchor.offset);
+                if (matchesSignatureAt(candidateStart, sig)) {
+                    verifiedMatches++;
+                    if (verifiedMatches > 1) return false;
+                }
+            } catch (Exception e) {
+                // This anchor occurrence cannot be the requested full signature start.
+            }
+        }
+        return verifiedMatches == 1;
+    }
+
+    private AnchorMatches getAnchorMatches(ByteSignature anchor) throws CancelledException {
+        String key = getExactSignatureKey(anchor);
+        AnchorMatches cached = anchorMatchesCache.get(key);
+        if (cached != null) return cached;
+
+        List<Address> matches = new ArrayList<>();
+        Address searchFrom = null;
+        boolean complete = false;
+
+        for (int examined = 0; examined < MAX_ANCHOR_MATCHES_TO_VERIFY; examined++) {
+            monitor.checkCancelled();
+            Address anchorMatch = findInExecutableMemory(anchor, searchFrom);
+            if (anchorMatch == null) {
+                complete = true;
+                break;
+            }
+            matches.add(anchorMatch);
+
+            try {
+                searchFrom = anchorMatch.add(1);
+            } catch (Exception e) {
+                complete = true;
+                break;
+            }
+        }
+
+        if (!complete && matches.size() == MAX_ANCHOR_MATCHES_TO_VERIFY) {
+            complete = findInExecutableMemory(anchor, searchFrom) == null;
+        }
+
+        AnchorMatches result = new AnchorMatches(matches, complete);
+        if (anchorMatchesCache.size() < MAX_ANCHOR_CACHE_ENTRIES) {
+            anchorMatchesCache.put(key, result);
+        }
+        return result;
+    }
+
+    private String getExactSignatureKey(ByteSignature signature) {
+        StringBuilder key = new StringBuilder(signature.bytes.length * 2);
+        for (byte value : signature.bytes) key.append(String.format("%02X", value));
+        return key.toString();
+    }
+
+    private boolean determineUniquenessWithMaskedSearch(ByteSignature sig)
+            throws CancelledException {
+        Address firstMatch = findInExecutableMemory(sig, null);
+        if (firstMatch == null) return false;
+        try {
+            return findInExecutableMemory(sig, firstMatch.add(1)) == null;
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    private ConcreteAnchor getLongestConcreteAnchor(ByteSignature sig) {
+        int bestStart = -1;
+        int bestLength = 0;
+        int runStart = 0;
+        int runLength = 0;
+
+        for (int i = 0; i < sig.mask.length; i++) {
+            if ((sig.mask[i] & 0xff) == 0xff) {
+                if (runLength == 0) runStart = i;
+                runLength++;
+                if (runLength > bestLength) {
+                    bestStart = runStart;
+                    bestLength = runLength;
+                }
+            } else {
+                runLength = 0;
+            }
+        }
+
+        if (bestLength < MIN_CONCRETE_ANCHOR_BYTES) return null;
+        byte[] bytes = Arrays.copyOfRange(sig.bytes, bestStart, bestStart + bestLength);
+        byte[] mask = new byte[bestLength];
+        Arrays.fill(mask, (byte) 0xff);
+        return new ConcreteAnchor(new ByteSignature(bytes, mask), bestStart);
+    }
+
+    private boolean matchesSignatureAt(Address start, ByteSignature sig) {
+        try {
+            Memory mem = currentProgram.getMemory();
+            MemoryBlock block = mem.getBlock(start);
+            if (block == null || !block.isExecute()) return false;
+
+            Address end = start.add(sig.bytes.length - 1);
+            if (end.compareTo(block.getEnd()) > 0) return false;
+
+            byte[] actual = new byte[sig.bytes.length];
+            mem.getBytes(start, actual);
+            for (int i = 0; i < actual.length; i++) {
+                if ((sig.mask[i] & 0xff) == 0xff && actual[i] != sig.bytes[i]) return false;
+            }
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    private boolean isSupportedX86Program() {
+        Processor x86 = Processor.findOrPossiblyCreateProcessor("x86");
+        int pointerSize = currentProgram.getDefaultPointerSize();
+        return currentProgram.getLanguage().getProcessor().equals(x86) &&
+               (pointerSize == 4 || pointerSize == 8);
+    }
+
+    private void resetConfigurationDefaults() {
+        MAX_INSTRUCTIONS_TO_SCAN = DEFAULT_MAX_INSTRUCTIONS_TO_SCAN;
+        MIN_WINDOW_BYTES = DEFAULT_MIN_WINDOW_BYTES;
+        MAX_WINDOW_BYTES = DEFAULT_MAX_WINDOW_BYTES;
+        MIN_CONCRETE_BYTES = DEFAULT_MIN_CONCRETE_BYTES;
+        HEAD_CHECK_SPAN = DEFAULT_HEAD_CHECK_SPAN;
+        XREF_CONTEXT_INSTRUCTIONS = DEFAULT_XREF_CONTEXT_INSTRUCTIONS;
+        MAX_START_OFFSET = DEFAULT_MAX_START_OFFSET;
     }
 
     private Address getDefaultAddress(long offset) {
@@ -754,6 +1292,21 @@ public class Sigga extends GhidraScript {
                     mask[i] = (byte) 0xFF;
                 }
             }
+        }
+
+        public ByteSignature(byte[] bytes, byte[] mask) {
+            this.bytes = bytes;
+            this.mask = mask;
+        }
+    }
+
+    private static class ConcreteAnchor {
+        ByteSignature signature;
+        int offset;
+
+        ConcreteAnchor(ByteSignature signature, int offset) {
+            this.signature = signature;
+            this.offset = offset;
         }
     }
 }
