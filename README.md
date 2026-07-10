@@ -7,10 +7,10 @@ Sigga is a Ghidra script for creating x86/x64 function signatures. It is well do
 This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
 - **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
-- **Shared x86/x64 Defaults:** Uses a 10-96 byte window, four-byte head check, and at least six concrete bytes without architecture-specific profiles.
+- **Shared x86/x64 Defaults:** Uses an 8-96 byte window, four-byte head check, and at least six concrete bytes without architecture-specific profiles.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
-- **Practical Search:** Instruction-aligned candidates are ranked by emitted length after wildcard trimming, concrete-byte density, then offset. Search scope is executable memory only, using concrete anchors before masked verification.
-- **Ranked XRef Fallback:** If direct code is too generic, Sigga evaluates all supported reference sites and chooses the shortest deterministic resolver-safe candidate within configured byte limits.
+- **Practical Search:** Instruction-aligned candidates are ranked by emitted length after wildcard trimming, concrete-byte density, then offset. Search scope is executable memory only, using cached concrete anchors with a bounded verification cap before masked fallback.
+- **Ranked XRef Fallback:** If direct code is too generic, Sigga keeps a bounded queue of the 512 best distinct resolver-safe windows, evaluates them shortest-first, and stops at the first unique result.
 - **Resolvable References:** Supports relative `CALL`/`JMP` forms with 8-, 16-, or 32-bit displacements where valid, plus x64 RIP-relative `LEA`, and prints candidate-relative resolver metadata.
 - **x86/x64-aware Masking:** Masks common relative branches, relocations, RIP-relative operands, and absolute mapped references. Ghidra operand masks identify value-byte fields; ambiguous fallback matches remain concrete.
 - **Professional Offset Signatures:** The script produces industry-standard signatures with offsets, avoiding problematic leading wildcards.
