@@ -7,6 +7,7 @@ Sigga is a Ghidra script for creating x86/x64 function signatures. It is well do
 This script contains the core functionality of signature creation, plus advanced features to handle complex, real-world binaries where other tools might fail.
 
 - **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
+- **Shared x86/x64 Defaults:** Uses a 10-96 byte window, four-byte head check, and at least six concrete bytes without architecture-specific profiles.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
 - **Practical Search:** Instruction-aligned candidates are ranked by emitted length after wildcard trimming, concrete-byte density, then offset. Search scope is executable memory only, using concrete anchors before masked verification.
 - **Ranked XRef Fallback:** If direct code is too generic, Sigga evaluates all supported reference sites and chooses the shortest deterministic resolver-safe candidate within configured byte limits.
@@ -69,4 +70,5 @@ Feel free to open a pull request, but please make sure your changes/new code are
 - Generates single-build heuristics, not a cross-version compatibility guarantee.
 - Tier 3 signatures require applying printed resolver metadata to recover the referenced function.
 - XRef candidates obey configured minimum and maximum emitted signature lengths.
+- Every emitted tier requires the configured minimum number of concrete bytes (six by default).
 - Far and ambiguous indirect XRefs are intentionally excluded.

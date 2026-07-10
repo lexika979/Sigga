@@ -40,9 +40,10 @@ public class Sigga extends GhidraScript {
 
     // --- CONFIGURATION (defaults, overridable via dialog) ---
     private static final int DEFAULT_MAX_INSTRUCTIONS_TO_SCAN = 200;
-    private static final int DEFAULT_MIN_WINDOW_BYTES = 8;
-    private static final int DEFAULT_MAX_WINDOW_BYTES = 128;
-    private static final int DEFAULT_HEAD_CHECK_SPAN = 3;
+    private static final int DEFAULT_MIN_WINDOW_BYTES = 10;
+    private static final int DEFAULT_MAX_WINDOW_BYTES = 96;
+    private static final int DEFAULT_MIN_CONCRETE_BYTES = 6;
+    private static final int DEFAULT_HEAD_CHECK_SPAN = 4;
     private static final int DEFAULT_XREF_CONTEXT_INSTRUCTIONS = 8;
     private static final int DEFAULT_MAX_START_OFFSET = 64;
     private static final int MIN_CONCRETE_ANCHOR_BYTES = 4;
@@ -52,6 +53,7 @@ public class Sigga extends GhidraScript {
     private int MAX_INSTRUCTIONS_TO_SCAN = DEFAULT_MAX_INSTRUCTIONS_TO_SCAN;
     private int MIN_WINDOW_BYTES = DEFAULT_MIN_WINDOW_BYTES;
     private int MAX_WINDOW_BYTES = DEFAULT_MAX_WINDOW_BYTES;
+    private int MIN_CONCRETE_BYTES = DEFAULT_MIN_CONCRETE_BYTES;
     private int HEAD_CHECK_SPAN = DEFAULT_HEAD_CHECK_SPAN;
     private int XREF_CONTEXT_INSTRUCTIONS = DEFAULT_XREF_CONTEXT_INSTRUCTIONS;
     private int MAX_START_OFFSET = DEFAULT_MAX_START_OFFSET;
@@ -221,13 +223,14 @@ public class Sigga extends GhidraScript {
             configModePanel.add(cfgCustom);
 
             // --- Configuration panel (hidden by default) ---
-            JPanel configPanel = new JPanel(new GridLayout(6, 2, 6, 4));
+            JPanel configPanel = new JPanel(new GridLayout(7, 2, 6, 4));
             configPanel.setBorder(BorderFactory.createTitledBorder("Configuration"));
             configPanel.setVisible(false);
 
             JSpinner spMaxInstr = new JSpinner(new SpinnerNumberModel(MAX_INSTRUCTIONS_TO_SCAN, 1, 10000, 10));
             JSpinner spMinWindow = new JSpinner(new SpinnerNumberModel(MIN_WINDOW_BYTES, 1, 256, 1));
             JSpinner spMaxWindow = new JSpinner(new SpinnerNumberModel(MAX_WINDOW_BYTES, 1, 1024, 8));
+            JSpinner spMinConcrete = new JSpinner(new SpinnerNumberModel(MIN_CONCRETE_BYTES, 1, 256, 1));
             JSpinner spHeadSpan = new JSpinner(new SpinnerNumberModel(HEAD_CHECK_SPAN, 1, 32, 1));
             JSpinner spXrefCtx = new JSpinner(new SpinnerNumberModel(XREF_CONTEXT_INSTRUCTIONS, 1, 64, 1));
             JSpinner spMaxOffset = new JSpinner(new SpinnerNumberModel(MAX_START_OFFSET, 1, 4096, 8));
@@ -238,6 +241,8 @@ public class Sigga extends GhidraScript {
             configPanel.add(spMinWindow);
             configPanel.add(new JLabel("Max signature length (bytes):"));
             configPanel.add(spMaxWindow);
+            configPanel.add(new JLabel("Min concrete bytes:"));
+            configPanel.add(spMinConcrete);
             configPanel.add(new JLabel("Head check span (bytes):"));
             configPanel.add(spHeadSpan);
             configPanel.add(new JLabel("XRef context instructions:"));
@@ -251,6 +256,7 @@ public class Sigga extends GhidraScript {
                 spMaxInstr.setValue(MAX_INSTRUCTIONS_TO_SCAN);
                 spMinWindow.setValue(MIN_WINDOW_BYTES);
                 spMaxWindow.setValue(MAX_WINDOW_BYTES);
+                spMinConcrete.setValue(MIN_CONCRETE_BYTES);
                 spHeadSpan.setValue(HEAD_CHECK_SPAN);
                 spXrefCtx.setValue(XREF_CONTEXT_INSTRUCTIONS);
                 spMaxOffset.setValue(MAX_START_OFFSET);
@@ -280,15 +286,23 @@ public class Sigga extends GhidraScript {
                 } else {
                     int minW = (int) spMinWindow.getValue();
                     int maxW = (int) spMaxWindow.getValue();
+                    int minConcrete = (int) spMinConcrete.getValue();
                     if (minW > maxW) {
                         JOptionPane.showMessageDialog(dialog,
                             "Min signature length (" + minW + ") cannot exceed max (" + maxW + ").",
                             "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
                         return;
                     }
+                    if (minConcrete > maxW) {
+                        JOptionPane.showMessageDialog(dialog,
+                            "Min concrete bytes (" + minConcrete + ") cannot exceed max signature length (" + maxW + ").",
+                            "Invalid Configuration", JOptionPane.WARNING_MESSAGE);
+                        return;
+                    }
                     MAX_INSTRUCTIONS_TO_SCAN = (int) spMaxInstr.getValue();
                     MIN_WINDOW_BYTES = minW;
                     MAX_WINDOW_BYTES = maxW;
+                    MIN_CONCRETE_BYTES = minConcrete;
                     HEAD_CHECK_SPAN = (int) spHeadSpan.getValue();
                     XREF_CONTEXT_INSTRUCTIONS = (int) spXrefCtx.getValue();
                     MAX_START_OFFSET = (int) spMaxOffset.getValue();
@@ -426,6 +440,7 @@ public class Sigga extends GhidraScript {
                 int finalLength = countSignatureTokens(finalSig);
                 if (finalLength < MIN_WINDOW_BYTES) continue;
                 if (finalLength > MAX_WINDOW_BYTES) break;
+                if (countConcreteTokens(finalSig) < MIN_CONCRETE_BYTES) continue;
 
                 int bestLength = best == null ? Integer.MAX_VALUE : countSignatureTokens(best.signature);
                 if (finalLength > bestLength) break;
@@ -838,6 +853,7 @@ public class Sigga extends GhidraScript {
                 int finalLength = countSignatureTokens(finalSignature);
                 if (finalLength < MIN_WINDOW_BYTES) continue;
                 if (finalLength > MAX_WINDOW_BYTES) break;
+                if (countConcreteTokens(finalSignature) < MIN_CONCRETE_BYTES) continue;
 
                 int bestLength = best == null ? Integer.MAX_VALUE :
                     countSignatureTokens(best.result.signature);
@@ -1114,6 +1130,7 @@ public class Sigga extends GhidraScript {
         MAX_INSTRUCTIONS_TO_SCAN = DEFAULT_MAX_INSTRUCTIONS_TO_SCAN;
         MIN_WINDOW_BYTES = DEFAULT_MIN_WINDOW_BYTES;
         MAX_WINDOW_BYTES = DEFAULT_MAX_WINDOW_BYTES;
+        MIN_CONCRETE_BYTES = DEFAULT_MIN_CONCRETE_BYTES;
         HEAD_CHECK_SPAN = DEFAULT_HEAD_CHECK_SPAN;
         XREF_CONTEXT_INSTRUCTIONS = DEFAULT_XREF_CONTEXT_INSTRUCTIONS;
         MAX_START_OFFSET = DEFAULT_MAX_START_OFFSET;
