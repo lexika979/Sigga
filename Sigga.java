@@ -159,13 +159,18 @@ public class Sigga extends GhidraScript {
 
     @Override
     public void run() throws Exception {
-        if (!isSupportedX86Program()) {
-            printerr("Sigga: Only 32-bit x86 and 64-bit x86 programs are supported.");
+        if (currentProgram == null) {
+            printerr("Sigga: No program is open.");
             return;
         }
 
         if (currentLocation == null) {
             printerr("Sigga: No cursor location found. Please run this script from the Listing window.");
+            return;
+        }
+
+        if (!isSupportedX86Program()) {
+            printerr("Sigga: Only 32-bit x86 and 64-bit x86 programs are supported.");
             return;
         }
 
