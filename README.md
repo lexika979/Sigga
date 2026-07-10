@@ -8,9 +8,10 @@ This script contains the core functionality of signature creation, plus advanced
 
 - **Guided Generation:** Opens a small settings dialog so you can choose function-start vs current-address scanning, allow or skip XRef fallback, and optionally tune scan limits.
 - **Auto-Cascading Tiers:** Automatically retries with lower strictness or different strategies if a unique signature cannot be found initially.
-- **Practical Search:** Instruction-aligned candidates are ranked by shortest length, concrete-byte density, then offset. Search scope is executable memory only.
-- **Resolvable XRef Fallback:** If direct code is too generic, Sigga can use a direct `CALL`, direct `JMP`, or x64 RIP-relative `LEA` reference and prints exact rel32 resolver metadata.
-- **x86/x64-aware Masking:** Masks common relative branches, relocations, RIP-relative operands, and absolute mapped references without trying to decode every possible instruction form.
+- **Practical Search:** Instruction-aligned candidates are ranked by emitted length after wildcard trimming, concrete-byte density, then offset. Search scope is executable memory only, using concrete anchors before masked verification.
+- **Ranked XRef Fallback:** If direct code is too generic, Sigga evaluates all supported reference sites and chooses the shortest deterministic resolver-safe candidate within configured byte limits.
+- **Resolvable References:** Supports relative `CALL`/`JMP` forms with 8-, 16-, or 32-bit displacements where valid, plus x64 RIP-relative `LEA`, and prints candidate-relative resolver metadata.
+- **x86/x64-aware Masking:** Masks common relative branches, relocations, RIP-relative operands, and absolute mapped references. Ghidra operand masks identify value-byte fields; ambiguous fallback matches remain concrete.
 - **Professional Offset Signatures:** The script produces industry-standard signatures with offsets, avoiding problematic leading wildcards.
 
 Sigga measures uniqueness in executable memory of the opened program. Its confidence score is heuristic; validate generated patterns against a later build before relying on patch resistance.
@@ -67,3 +68,5 @@ Feel free to open a pull request, but please make sure your changes/new code are
 - Supports 32-bit and 64-bit x86 programs only.
 - Generates single-build heuristics, not a cross-version compatibility guarantee.
 - Tier 3 signatures require applying printed resolver metadata to recover the referenced function.
+- XRef candidates obey configured minimum and maximum emitted signature lengths.
+- Far and ambiguous indirect XRefs are intentionally excluded.
